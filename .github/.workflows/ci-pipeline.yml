@@ -1,0 +1,256 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  IMAGE: mrmonster786/rnr-backend
+  TAG: ${{ github.run_number }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Static Analysis & Security (Python Quality Checks)
+  # ─────────────────────────────────────────────
+  python-quality-checks:
+    name: Python Quality Checks
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.10-slim
+      options: --user 0
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install security tools
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install --upgrade pip
+          pip install bandit pip-audit
+
+      - name: Run Bandit and pip-audit in parallel
+        run: |
+          . venv/bin/activate
+          bandit -r . --exclude ./venv,./tests -lll -iii -f json -o bandit-report.json &
+          bandit -r . --exclude ./venv,./tests -lll -iii -f html  -o bandit-report.html &
+          pip-audit --format json --output pip-audit-report.json &
+          wait
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            bandit-report.html
+            pip-audit-report.json
+
+  # ─────────────────────────────────────────────
+  # 2. Build Docker Image
+  # ─────────────────────────────────────────────
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: python-quality-checks
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t $IMAGE:$TAG .
+
+      - name: Save Docker image as tarball
+        run: docker save $IMAGE:$TAG -o image.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # 3. Deploy to Testing Environment
+  #    (only on pipeline-branch, mirrors Jenkins behaviour)
+  # ─────────────────────────────────────────────
+  deploy-testing:
+    name: Deploy to VM1 (Testing)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/pipeline-branch'
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Stop and remove existing container
+        run: |
+          docker stop rnr-backend-test || true
+          docker rm   rnr-backend-test || true
+
+      - name: Run container
+        env:
+          DATABASE_URL: ${{ secrets.RR_BACKEND_DB_URL }}
+          SECRET_KEY:   ${{ secrets.RR_BACKEND_SECRET_KEY }}
+          SMTP_PASSWORD: ${{ secrets.RR_BACKEND_SMTP_PASSWORD }}
+          SMTP_USERNAME: ${{ secrets.RR_BACKEND_SMTP_USERNAME }}
+        run: |
+          docker run -d \
+            --name rnr-backend-test \
+            --restart always \
+            -p 8000:8000 \
+            -e DATABASE_URL="${DATABASE_URL}" \
+            -e SECRET_KEY="${SECRET_KEY}" \
+            -e SMTP_PASSWORD="${SMTP_PASSWORD}" \
+            -e SMTP_USERNAME="${SMTP_USERNAME}" \
+            -e SMTP_HOST="smtp.gmail.com" \
+            -e SMTP_PORT="587" \
+            -e SMTP_USE_TLS="true" \
+            -e SMTP_USE_SSL="false" \
+            -e FRONTEND_URL="https://localhost:3000" \
+            -e ACCESS_TOKEN_EXPIRE_MINUTES="30" \
+            $IMAGE:$TAG
+
+      - name: Deployment notice
+        run: echo "Application deployed to http://192.168.116.137:8000"
+
+  # ─────────────────────────────────────────────
+  # 4. Publish Security Dashboard (HTML reports)
+  #    Runs after all jobs, even on failure
+  # ─────────────────────────────────────────────
+  publish-reports:
+    name: Publish Security Dashboard
+    runs-on: ubuntu-latest
+    needs: [python-quality-checks, build]
+    if: always()
+
+    steps:
+      - name: Download security reports
+        uses: actions/download-artifact@v4
+        with:
+          name: security-reports
+        continue-on-error: true
+
+      - name: Upload HTML reports as dashboard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-dashboard
+          path: bandit-report.html
+          if-no-files-found: warn
+
+  # ─────────────────────────────────────────────
+  # [COMMENTED OUT] Secrets Scan (Gitleaks)
+  # Uncomment and add gitleaks to your runner to enable.
+  #
+  # gitleaks:
+  #   name: Secrets Scan (Gitleaks)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Run Gitleaks
+  #       run: |
+  #         gitleaks detect --source . \
+  #           --report-format json \
+  #           --report-path gitleaks-report.json \
+  #           --exit-code 0
+  # ─────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # [COMMENTED OUT] Container Scan (Trivy)
+  #
+  # trivy-scan:
+  #   name: Container Scan (Trivy)
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         name: docker-image
+  #     - run: docker load -i image.tar
+  #     - name: Run Trivy
+  #       run: |
+  #         trivy image --scanners vuln \
+  #           --severity HIGH,CRITICAL \
+  #           --format json \
+  #           --output trivy-report.json \
+  #           $IMAGE:$TAG || true
+  # ─────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # [COMMENTED OUT] DAST (OWASP ZAP)
+  #
+  # zap-dast:
+  #   name: DAST (OWASP ZAP)
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         name: docker-image
+  #     - run: docker load -i image.tar
+  #     - name: Create Docker network
+  #       run: docker network create zap-net || true
+  #     - name: Start target app
+  #       env:
+  #         DATABASE_URL: ${{ secrets.RR_BACKEND_DB_URL }}
+  #         SECRET_KEY:   ${{ secrets.RR_BACKEND_SECRET_KEY }}
+  #       run: |
+  #         docker run -d \
+  #           --name target-app \
+  #           --network zap-net \
+  #           -e DATABASE_URL="${DATABASE_URL}" \
+  #           -e SECRET_KEY="${SECRET_KEY}" \
+  #           $IMAGE:$TAG
+  #         sleep 10
+  #     - name: Run ZAP baseline scan
+  #       run: |
+  #         docker run --rm --user 0 --network zap-net \
+  #           -v $(pwd):/zap/wrk/:rw \
+  #           ghcr.io/zaproxy/zaproxy:stable \
+  #           zap-baseline.py -t http://target-app:8000 -r zap-report.html || true
+  #     - name: Cleanup
+  #       if: always()
+  #       run: |
+  #         docker stop  target-app || true
+  #         docker rm    target-app || true
+  #         docker network rm zap-net || true
+  # ─────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # [COMMENTED OUT] Push Image to DockerHub
+  #
+  # push-image:
+  #   name: Push Image to DockerHub
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   if: github.ref == 'refs/heads/develop'
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         name: docker-image
+  #     - run: docker load -i image.tar
+  #     - name: Login and push
+  #       env:
+  #         DOCKER_USER: ${{ secrets.DOCKER_USER }}
+  #         DOCKER_PASS: ${{ secrets.DOCKER_PASS }}
+  #       run: |
+  #         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+  #         docker push $IMAGE:$TAG
+  #         docker tag  $IMAGE:$TAG $IMAGE:latest
+  #         docker push $IMAGE:latest
+  # ─────────────────────────────────────────────

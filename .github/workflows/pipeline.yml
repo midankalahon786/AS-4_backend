@@ -83,21 +83,22 @@ jobs:
             docker pull mrmonster786/rnr-backend:latest
             docker stop rnr-backend-test || true
             docker rm   rnr-backend-test || true
-            docker run -d \
-              --name rnr-backend-test \
-              --restart always \
-              -p 8000:8000 \
-              -e DATABASE_URL="${{ secrets.RR_BACKEND_DB_URL }}" \
-              -e SECRET_KEY="${{ secrets.RR_BACKEND_SECRET_KEY }}" \
-              -e SMTP_PASSWORD="${{ secrets.RR_BACKEND_SMTP_PASSWORD }}" \
-              -e SMTP_USERNAME="${{ secrets.RR_BACKEND_SMTP_USERNAME }}" \
-              -e SMTP_HOST="smtp.gmail.com" \
-              -e SMTP_PORT="587" \
-              -e SMTP_USE_TLS="true" \
-              -e SMTP_USE_SSL="false" \
-              -e FRONTEND_URL="https://localhost:3000" \
-              -e ACCESS_TOKEN_EXPIRE_MINUTES="30" \
-              mrmonster786/rnr-backend:latest
+             docker run -d \
+            --name rnr-backend-test \
+            --restart always \
+            -p 8000:8000 \
+            -e DATABASE_URL="${{ secrets.RR_BACKEND_DB_URL }}" \
+            -e SECRET_KEY="${{ secrets.RR_BACKEND_SECRET_KEY }}" \
+            -e SMTP_PASSWORD="${{ secrets.RR_BACKEND_SMTP_PASSWORD }}" \
+            -e SMTP_USERNAME="${{ secrets.RR_BACKEND_SMTP_USERNAME }}" \
+            -e SMTP_FROM_EMAIL="${{ secrets.RR_BACKEND_SMTP_FROM_EMAIL }}" \ 
+            -e SMTP_HOST="smtp.gmail.com" \
+            -e SMTP_PORT="587" \
+            -e SMTP_USE_TLS="true" \
+            -e SMTP_USE_SSL="false" \
+            -e FRONTEND_URL="https://localhost:3000" \
+            -e ACCESS_TOKEN_EXPIRE_MINUTES="30" \
+            mrmonster786/rnr-backend:latest
             echo "Deployed to http://${{ secrets.EC2_HOST }}:8000"
 
   # 4. Publish Security Dashboard (unchanged)

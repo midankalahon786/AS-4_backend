@@ -1,5 +1,6 @@
 """
 src/employees/main.py  — Employee Service entry point.
+Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
 """
 from __future__ import annotations
 
@@ -10,26 +11,23 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-# CORSMiddleware import removed
 from fastapi.openapi.utils import get_openapi
-from prisma.errors import UniqueViolationError
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
+from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.middleware import (
-    generic_exception_handler, http_exception_handler,
-    prisma_unique_violation_handler, request_rate_limit_middleware,
+    generic_exception_handler,
+    http_exception_handler,
+    request_rate_limit_middleware,
     validation_exception_handler,
 )
-from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.route_registry import register_app_routes
+from src.common.telemetry import setup_telemetry
+from src.core.database import async_session_factory, engine
 from src.employees.internal_router import router as internal_router
 from src.employees.router import router as emp_router
 from src.notifications.email_sender import EmailSender, SMTPConfig
@@ -37,20 +35,9 @@ from src.notifications.redis_client import connect_redis, disconnect_redis
 from src.notifications.router import router as notifications_router
 from src.notifications.slack_sender import SlackConfig, SlackSender
 from src.notifications.worker import email_worker_loop, process_celebrations
-from src.prisma.client import connect_with_retry, db
 from src.webhooks.router import router as webhooks_router
 
 logger = logging.getLogger(__name__)
-
-resource = Resource.create({"service.name": "rnr-employees"})
-provider = TracerProvider(resource=resource)
-otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-if otlp_endpoint:
-    try:
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-    except Exception as exc:
-        logger.warning("OTLP init failed: %s", exc)
-trace.set_tracer_provider(provider)
 
 ROLE_OVERRIDES = {
     "GET:/aabhar/v1/employees/list":                                  ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
@@ -58,6 +45,10 @@ ROLE_OVERRIDES = {
     "POST:/aabhar/v1/employees/create":                               ["SUPER_ADMIN", "HR_ADMIN"],
     "PUT:/aabhar/v1/employees/{employee_id}":                         ["SUPER_ADMIN", "HR_ADMIN"],
     "PATCH:/aabhar/v1/employees/{employee_id}":                       ["SUPER_ADMIN", "HR_ADMIN"],
+    "POST:/aabhar/v1/employees/{employee_id}/activate":               ["SUPER_ADMIN", "HR_ADMIN"],
+    "PATCH:/aabhar/v1/employees/{employee_id}/activate":              ["SUPER_ADMIN", "HR_ADMIN"],
+    "POST:/aabhar/v1/employees/{employee_id}/deactivate":             ["SUPER_ADMIN", "HR_ADMIN"],
+    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate":            ["SUPER_ADMIN", "HR_ADMIN"],
     "GET:/aabhar/v1/employees/notifications":                         ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
     "GET:/aabhar/v1/employees/notifications/unread-count":            ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
     "PUT:/aabhar/v1/employees/notifications/{notification_id}/read":  ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
@@ -72,6 +63,10 @@ ROUTE_TITLES = {
     "POST:/aabhar/v1/employees/create":                               "Create Employee",
     "PUT:/aabhar/v1/employees/{employee_id}":                         "Update Employee",
     "PATCH:/aabhar/v1/employees/{employee_id}":                       "Partially Update Employee",
+    "POST:/aabhar/v1/employees/{employee_id}/activate":               "Activate Employee",
+    "PATCH:/aabhar/v1/employees/{employee_id}/activate":              "Activate Employee",
+    "POST:/aabhar/v1/employees/{employee_id}/deactivate":             "Deactivate Employee",
+    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate":            "Deactivate Employee",
     "GET:/aabhar/v1/employees/notifications":                         "List Notifications",
     "GET:/aabhar/v1/employees/notifications/unread-count":            "Get Unread Notification Count",
     "PUT:/aabhar/v1/employees/notifications/{notification_id}/read":  "Mark Notification as Read",
@@ -83,15 +78,26 @@ ROUTE_TITLES = {
 
 _PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
 
-_CELEB_HOUR   = int(os.getenv("CELEBRATION_CRON_HOUR",  "0"))
+_CELEB_HOUR = int(os.getenv("CELEBRATION_CRON_HOUR", "0"))
 _CELEB_MINUTE = int(os.getenv("CELEBRATION_CRON_MINUTE", "5"))
+
+
+async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+    """Handles unique constraints (e.g., username/email collisions) cleanly."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "A database constraint was violated. Record may already exist."},
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_with_retry()
-    print("Employee Service: 🟢 Database Connected")
+    # 1. Verify PostgreSQL connection via SQLAlchemy
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    print("Employee Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
+    # 2. Redis setup
     r = None
     try:
         r = await connect_redis()
@@ -99,7 +105,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Redis unavailable: %s", exc)
 
-    smtp_config  = SMTPConfig.from_env()
+    smtp_config = SMTPConfig.from_env()
     email_sender = EmailSender(smtp_config)
 
     slack_sender: SlackSender | None = None
@@ -111,14 +117,16 @@ async def lifespan(app: FastAPI):
 
     app.state.redis = r
 
+    # 3. Background worker using session factory
     worker_task = None
     if r is not None:
         worker_task = asyncio.create_task(
-            email_worker_loop(db, email_sender, r, slack_sender),
+            email_worker_loop(async_session_factory, email_sender, r, slack_sender),
             name="email_worker",
         )
         print("Employee Service: 📧 Email worker started")
 
+    # 4. APScheduler for celebrations
     scheduler = None
     if r is not None:
         _lock_key = "apscheduler:celebration:lock"
@@ -130,7 +138,7 @@ async def lifespan(app: FastAPI):
                 logger.info("Celebration job: lock held by another instance — skipping")
                 return
             try:
-                await process_celebrations(db, email_sender, r, slack_sender)
+                await process_celebrations(async_session_factory, email_sender, r, slack_sender)
             finally:
                 await r.delete(_lock_key)
 
@@ -155,6 +163,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean shutdown
     registry_task.cancel()
 
     if scheduler is not None:
@@ -169,8 +178,8 @@ async def lifespan(app: FastAPI):
             pass
 
     await disconnect_redis()
-    await db.disconnect()
-    print("Employee Service: 🔴 Disconnected")
+    await engine.dispose()
+    print("Employee Service: 🔴 Database Disconnected & Pool Disposed")
 
 
 async def _load_route_registry(app: FastAPI) -> None:
@@ -208,7 +217,7 @@ app = FastAPI(
 initialize_cors_and_middleware(app)
 
 app.middleware("http")(request_rate_limit_middleware)
-app.add_exception_handler(UniqueViolationError,   prisma_unique_violation_handler)
+app.add_exception_handler(IntegrityError,         sqlalchemy_integrity_error_handler)
 app.add_exception_handler(HTTPException,          http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception,              generic_exception_handler)
@@ -236,8 +245,12 @@ app.include_router(internal_router)
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
-    schema = get_openapi(title=app.title, version=app.version,
-                        description=app.description, routes=app.routes)
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
     schema.setdefault("components", {})
     schema["components"]["securitySchemes"] = {
         "BearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
@@ -253,7 +266,7 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
-FastAPIInstrumentor.instrument_app(app, excluded_urls="health,/docs,/openapi.json,internal")
+setup_telemetry(app, "rnr-employees", excluded_urls="health,/docs,/openapi.json,internal")
 
 if __name__ == "__main__":
     uvicorn.run("src.employees.main:app", host="0.0.0.0", port=8003, reload=True)

@@ -102,7 +102,7 @@ async def enqueue_notification(r: aioredis.Redis, notification_id: str) -> None:
         logger.warning("Redis enqueue failed for %s — worker will recover on next scan", notification_id)
 
 
-async def dequeue_notification(r: aioredis.Redis, timeout: int = 5) -> str | None:
+async def dequeue_notification(r: aioredis.Redis, timeout: int = 2) -> str | None:
     """
     Blocking pop — returns a notification_id or None on timeout.
     timeout=5 means the worker wakes up at least every 5s to check for shutdown.

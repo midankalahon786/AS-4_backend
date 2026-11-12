@@ -1,49 +1,55 @@
+"""
+src/digest/schemas.py
+─────────────────────
+Pydantic v2 schemas for the Weekly Recognition Digest.
+"""
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional
+from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, UUID4
+from pydantic import BaseModel, ConfigDict, EmailStr
 
-
-# ── Sub-models ─────────────────────────────────────────────────────────────────
 
 class TopPerformer(BaseModel):
-    employee_id: UUID4
+    model_config = ConfigDict(from_attributes=True)
+
+    employee_id: UUID
     username: str
     count: int
 
 
 class WeeklyDigestData(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     week_start: datetime
     week_end: datetime
     total_recognitions: int
     total_points_awarded: float
     unique_givers: int
     unique_receivers: int
-    top_giver: Optional[TopPerformer] = None
-    top_receiver: Optional[TopPerformer] = None
+    top_giver: TopPerformer | None = None
+    top_receiver: TopPerformer | None = None
 
-
-# ── Request ────────────────────────────────────────────────────────────────────
 
 class DigestEmailRequest(BaseModel):
     """
-    Trigger a weekly digest email for a specific manager.
+    Trigger a weekly digest email for a specific manager[cite: 36].
 
-    manager_id  — the employee UUID of the manager whose team to scope the
-                  digest to. Only reviews where the receiver reports to this
-                  manager (employees.manager_id == manager_id) are included.
-                  When omitted the digest covers the whole platform.
-
-    week_start  — defaults to last completed Monday (UTC) if omitted.
+    manager_id — UUID of the manager to scope the digest to[cite: 36].
+                 When omitted, covers platform-wide data[cite: 36].
+    week_start — Monday 00:00 UTC; defaults to last completed week[cite: 36].
     """
+    model_config = ConfigDict(extra="forbid")
+
     manager_email: EmailStr
-    manager_id:    Optional[UUID4] = None
-    week_start:    Optional[datetime] = None
+    manager_id: UUID | None = None
+    week_start: datetime | None = None
 
-
-# ── Response ───────────────────────────────────────────────────────────────────
 
 class DigestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     success: bool
     message: str
-    data: Optional[WeeklyDigestData] = None
+    data: WeeklyDigestData | None = None

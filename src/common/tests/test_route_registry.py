@@ -1,8 +1,10 @@
+from contextlib import asynccontextmanager
 import sys
+import uuid
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.routing import APIRoute
 
 from src.common.route_registry import (
@@ -18,54 +20,17 @@ REG = "src.common.route_registry"
 
 @pytest.fixture
 def mock_app():
-    app = MagicMock(spec=FastAPI)
-    app.root_path = "/aabhar/v1/analytics"
-    route1 = MagicMock(spec=APIRoute); route1.path = "/leaderboard"; route1.methods = {"GET"}
-    route2 = MagicMock(spec=APIRoute); route2.path = "/redeem";      route2.methods = {"POST"}
-    app.routes = [route1, route2]
+    app = FastAPI(root_path="/aabhar/v1/analytics")
+    router = APIRouter()
+
+    @router.get("/leaderboard")
+    def leaderboard(): pass
+
+    @router.post("/redeem")
+    def redeem(): pass
+
+    app.include_router(router)
     return app
-
-
-def make_mock_db():
-    mock_db = MagicMock()
-    mock_db.roles.find_many               = AsyncMock()
-    mock_db.route_permissions.find_many   = AsyncMock()
-    mock_db.route_permissions.create_many = AsyncMock()
-    mock_db.route_permissions.update      = AsyncMock()
-    return mock_db
-
-
-def inject_db(mock_db):
-    """
-    Inject mock_db into sys.modules under every candidate path that
-    _do_register's local `from X import db` might resolve to.
-
-    We discover the real path by inspecting what's already in sys.modules
-    and looking for a module that actually has a 'db' attribute.
-    Works regardless of whether the real path is src.prisma.client,
-    src.database, prisma.client, etc.
-    """
-    candidates = [
-        key for key, mod in sys.modules.items()
-        if mod is not None and getattr(mod, "db", None) is not None
-        and "prisma" in key or "database" in key or "client" in key
-    ]
-
-    # Build a fake module wrapper that returns mock_db for `db`
-    fake_modules = {}
-    for path in candidates:
-        fake_mod = MagicMock()
-        fake_mod.db = mock_db
-        fake_modules[path] = fake_mod
-
-    # Fallback: also patch the most common candidate paths just in case
-    for fallback in ("src.prisma.client", "src.database", "prisma.client"):
-        if fallback not in fake_modules:
-            fake_mod = MagicMock()
-            fake_mod.db = mock_db
-            fake_modules[fallback] = fake_mod
-
-    return fake_modules
 
 
 class TestRouteRegistry:
@@ -78,6 +43,7 @@ class TestRouteRegistry:
         routes = _extract_routes(mock_app)
         assert len(routes) == 2
         assert ("GET", "/aabhar/v1/analytics/leaderboard") in routes
+        assert ("POST", "/aabhar/v1/analytics/redeem") in routes
 
     # ===========================================================================
     # CORE REGISTRATION LOGIC
@@ -86,44 +52,82 @@ class TestRouteRegistry:
     @pytest.mark.asyncio
     @patch(f"{REG}.asyncio.sleep", AsyncMock())
     async def test_do_register_new_routes(self, mock_app):
-        mock_db = make_mock_db()
-        mock_db.roles.find_many.return_value = [
-            MagicMock(role_code="ADMIN", role_id="r1")
-        ]
-        mock_db.route_permissions.find_many.return_value = []
-        mock_db.route_permissions.create_many.return_value = MagicMock(count=2)
+        role_id = uuid.uuid4()
+        mock_role = MagicMock(role_code="ADMIN", role_id=role_id)
 
-        with patch.dict(sys.modules, inject_db(mock_db)), \
+        mock_session = AsyncMock()
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
+
+        # Execute call results:
+        # 1. select(Role)
+        # 2. update(RoutePermission) stale
+        # 3. select(RoutePermission) existing
+        # 4. insert(RoutePermission)
+        res_roles = MagicMock()
+        res_roles.scalars.return_value.all.return_value = [mock_role]
+
+        res_existing = MagicMock()
+        res_existing.scalars.return_value.all.return_value = []
+
+        res_insert = MagicMock()
+        res_insert.rowcount = 2
+
+        mock_session.execute = AsyncMock(side_effect=[
+            res_roles,
+            MagicMock(),
+            res_existing,
+            res_insert,
+        ])
+
+        with patch("src.core.database.async_session_factory", return_value=mock_session), \
              patch.object(cache_module, "cache_delete", AsyncMock()):
 
-            await _do_register(mock_app, ["ADMIN"], {}, {})
+            await _do_register(mock_app, ["ADMIN"], {}, {}, apply_jitter=False)
 
-            mock_db.route_permissions.create_many.assert_called_once()
+            assert mock_session.execute.call_count >= 3
+            mock_session.commit.assert_called_once()
 
     @pytest.mark.asyncio
     @patch(f"{REG}.asyncio.sleep", AsyncMock())
     async def test_do_register_reactivate_inactive(self, mock_app):
-        mock_db = make_mock_db()
-        mock_db.roles.find_many.return_value = [
-            MagicMock(role_code="ADMIN", role_id="r1")
-        ]
+        role_id = uuid.uuid4()
+        mock_role = MagicMock(role_code="ADMIN", role_id=role_id)
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
 
         mock_inactive = MagicMock(
             route_key="GET:/aabhar/v1/analytics/leaderboard",
-            role_id="r1",
+            role_id=role_id,
             is_active=False,
-            id="row-999",
+            id=uuid.uuid4(),
         )
-        mock_db.route_permissions.find_many.return_value = [mock_inactive]
 
-        with patch.dict(sys.modules, inject_db(mock_db)), \
+        res_roles = MagicMock()
+        res_roles.scalars.return_value.all.return_value = [mock_role]
+
+        res_existing = MagicMock()
+        res_existing.scalars.return_value.all.return_value = [mock_inactive]
+
+        res_insert = MagicMock()
+        res_insert.rowcount = 1
+
+        mock_session.execute = AsyncMock(side_effect=[
+            res_roles,
+            MagicMock(),
+            res_existing,
+            res_insert,
+        ])
+
+        with patch("src.core.database.async_session_factory", return_value=mock_session), \
              patch.object(cache_module, "cache_delete", AsyncMock()):
 
-            await _do_register(mock_app, ["ADMIN"], {}, {})
+            await _do_register(mock_app, ["ADMIN"], {}, {}, apply_jitter=False)
 
-            mock_db.route_permissions.update.assert_called_once()
-            _, kwargs = mock_db.route_permissions.update.call_args
-            assert kwargs["data"]["is_active"] is True
+            assert mock_inactive.is_active is True
+            mock_session.commit.assert_called_once()
 
     # ===========================================================================
     # PUBLIC API & TIMEOUTS

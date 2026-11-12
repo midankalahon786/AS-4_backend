@@ -1,41 +1,53 @@
-# src/webhooks/schemas.py
+"""
+src/webhooks/schemas.py
+───────────────────────
+Pydantic v2 schemas for HRIS push webhook events and payloads.
+"""
 from __future__ import annotations
 
-from typing import Optional
-
-from pydantic import BaseModel, EmailStr
+from typing import Any
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class HrisEmployeeCreatedPayload(BaseModel):
-    external_id:      str
-    username:         str
-    email:            EmailStr
-    department_code:  str
+    model_config = ConfigDict(extra="ignore")
+
+    external_id: str
+    username: str
+    email: EmailStr
+    department_code: str
     designation_code: str
-    date_of_joining:  str
-    date_of_birth:    Optional[str]       = None
-    manager_email:    Optional[EmailStr]  = None
+    date_of_joining: str
+    date_of_birth: str | None = None
+    manager_email: EmailStr | None = None
 
 
 class HrisEmployeeUpdatedPayload(BaseModel):
-    email:            EmailStr
-    department_code:  Optional[str]       = None
-    designation_code: Optional[str]       = None
-    manager_email:    Optional[EmailStr]  = None
-    date_of_birth:    Optional[str]       = None
+    model_config = ConfigDict(extra="ignore")
+
+    email: EmailStr
+    department_code: str | None = None
+    designation_code: str | None = None
+    manager_email: EmailStr | None = None
+    date_of_birth: str | None = None
 
 
 class HrisEmployeeStatusPayload(BaseModel):
-    email:       EmailStr
+    model_config = ConfigDict(extra="ignore")
+
+    email: EmailStr
     status_code: str
 
 
 class HrisWebhookEvent(BaseModel):
-    event_id: Optional[str] = None   # idempotency key — HRIS should send this
-    event:    str
-    data:     dict
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str | None = Field(default=None, description="Idempotency key sent by HRIS")
+    event: str
+    data: dict[str, Any]
 
 
 class WebhookResponse(BaseModel):
     received: bool
-    event:    str
+    event: str
+    skipped: bool = False

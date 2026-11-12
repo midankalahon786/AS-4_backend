@@ -1,34 +1,36 @@
-import uvicorn
+"""
+src/roles/main.py
+─────────────────
+Roles & Permissions Service entry point.
+Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
+"""
+from __future__ import annotations
+
 import os
-from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from prisma.errors import UniqueViolationError
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from src.common.middleware import (
-    request_rate_limit_middleware,
-    http_exception_handler,
-    validation_exception_handler,
-    generic_exception_handler,
-    prisma_unique_violation_handler
-)
 from src.common.cors_setup import initialize_cors_and_middleware
-
-# --- OpenTelemetry Imports ---
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-from src.notifications.redis_client import connect_redis, disconnect_redis
-from src.prisma.client import db
-from src.roles.router import router
+from src.common.dependencies import close_auth_client
+from src.common.middleware import (
+    generic_exception_handler,
+    http_exception_handler,
+    request_rate_limit_middleware,
+    validation_exception_handler,
+)
 from src.common.route_registry import register_app_routes
+from src.common.telemetry import setup_telemetry
+from src.core.database import engine
+from src.notifications.redis_client import connect_redis, disconnect_redis
+from src.roles.router import router
 
-# ── Route configuration ───────────────────────────────────────────────────────
+# ── Route Configuration ───────────────────────────────────────────────────────
 ROLE_OVERRIDES: dict[str, list[str]] = {
     # ── Roles ─────────────────────────────────────────────────────────────────
     "GET:/aabhar/v1/roles/list":                           ["SUPER_ADMIN", "HR_ADMIN"],
@@ -39,7 +41,7 @@ ROLE_OVERRIDES: dict[str, list[str]] = {
     "POST:/aabhar/v1/roles/assign":                        ["SUPER_ADMIN"],
     "POST:/aabhar/v1/roles/revoke":                        ["SUPER_ADMIN"],
 
-    # ── Route permissions ─────────────────────────────────────────────────────
+    # ── Route Permissions ─────────────────────────────────────────────────────
     "GET:/aabhar/v1/roles/route-permissions":              ["SUPER_ADMIN"],
     "POST:/aabhar/v1/roles/route-permissions":             ["SUPER_ADMIN"],
     "PATCH:/aabhar/v1/roles/route-permissions":            ["SUPER_ADMIN"],
@@ -57,40 +59,34 @@ ROUTE_TITLES: dict[str, str] = {
     "POST:/aabhar/v1/roles/route-permissions":             "Add Route Permission",
     "PATCH:/aabhar/v1/roles/route-permissions":            "Remove Route Permission",
     "PATCH:/aabhar/v1/roles/route-permissions/title":      "Update Route Display Title",
+    "GET:/aabhar/v1/roles/my-permissions":                 "Get My Permissions",
 }
 
-# ── OpenTelemetry ─────────────────────────────────────────────────────────────
-resource       = Resource.create({"service.name": "rnr-roles"})
-provider       = TracerProvider(resource=resource)
-otlp_exporter  = OTLPSpanExporter()
-processor      = BatchSpanProcessor(otlp_exporter)
-provider.add_span_processor(processor)
-trace.set_tracer_provider(provider)
+
+async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+    """Handles role code or permission duplicate collisions cleanly."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "A database constraint was violated. A role or permission record already exists."},
+    )
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Roles Service: Connecting to Database...")
-    await db.connect()
+    # 1. Connect and verify PostgreSQL via SQLAlchemy
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    print("Roles Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
-    # Uncomment and Restart the backend if you have changed any routes or need to remove old lingering routes
-    # # This deletes any active route that doesn't start with '/aabhar' prefix
-    # await db.route_permissions.delete_many(
-    #     where={
-    #         "route_key": {"not": {"contains": "/aabhar/v1/"}}
-    #     }
-    # )
-    
-    print("Roles Service: 🟢 Database Connected")
-
-    print("Roles Service: Connecting to Redis...")
+    # 2. Redis setup
     try:
         await connect_redis()
-        print("Roles Service: ☑️ Redis Connected")
+        print("Roles Service: ☑️  Redis Connected")
     except Exception as e:
         print(f"Roles Service: ⚠️  Redis unavailable ({e})")
 
+    # 3. Dynamic route permissions registration
     await register_app_routes(
         app,
         default_roles=["SUPER_ADMIN"],
@@ -100,13 +96,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean shutdown
     print("Roles Service: Disconnecting Redis...")
     await disconnect_redis()
-    print("Roles Service: 🔴 Redis Disconnected")
+    await close_auth_client()
 
     print("Roles Service: Disconnecting Database...")
-    await db.disconnect()
-    print("Roles Service: 🔴 Database Disconnected")
+    await engine.dispose()
+    print("Roles Service: 🔴 Database Disconnected & Pool Disposed")
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -121,7 +118,8 @@ app = FastAPI(
 
 initialize_cors_and_middleware(app)
 
-app.add_exception_handler(UniqueViolationError, prisma_unique_violation_handler)
+app.middleware("http")(request_rate_limit_middleware)
+app.add_exception_handler(IntegrityError, sqlalchemy_integrity_error_handler)
 app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
@@ -129,15 +127,12 @@ app.add_exception_handler(Exception, generic_exception_handler)
 app.include_router(router)
 
 
-@app.get("/health")
+@app.get("/health", tags=["System"])
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "Roles Service"}
 
 
-FastAPIInstrumentor.instrument_app(
-    app,
-    excluded_urls="health,/docs,/openapi.json",
-)
+setup_telemetry(app, "rnr-roles", excluded_urls="health,/docs,/openapi.json")
 
 if __name__ == "__main__":
     uvicorn.run("src.roles.main:app", host="0.0.0.0", port=8002, reload=True)

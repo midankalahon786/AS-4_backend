@@ -80,6 +80,8 @@ async def cache_get(key: str, l1_ttl: int = L1_SHORT) -> Optional[Any]:
         value = json.loads(raw)
         lc_set(key, value, ttl=l1_ttl)
         return value
+    except RuntimeError:
+        return None
     except Exception as exc:
         logger.warning("cache_get(%s) failed: %s", key, exc)
         return None
@@ -103,6 +105,8 @@ async def cache_set(key: str, value: Any, ttl: int = TTL_SHORT, l1_ttl: int = L1
         r = get_redis()
         await r.setex(key, ttl, serialised)
         ok = True
+    except RuntimeError:
+        pass
     except Exception as exc:
         logger.warning("cache_set(%s) failed: %s", key, exc)
 
@@ -157,6 +161,8 @@ async def invalidate_pattern(pattern: str) -> int:
             await r.delete(*keys_to_delete)
             deleted = len(keys_to_delete)
             logger.debug("invalidate_pattern(%s): removed %d keys", pattern, deleted)
+    except RuntimeError:
+        pass
     except Exception as exc:
         logger.warning("invalidate_pattern(%s) failed: %s", pattern, exc)
     return deleted

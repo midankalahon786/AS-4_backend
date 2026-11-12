@@ -9,6 +9,12 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ==========================================
 # 1. ENVIRONMENT CONFIGURATION (.env)
 # ==========================================
@@ -33,9 +39,12 @@ if env_file.exists():
             
         # Set environment variable safely if it does not already exist
         os.environ.setdefault(key, val)
+    os.environ["PYTHONIOENCODING"] = "utf-8"
     print(f"Loaded environment from {env_file}")
 else:
+    os.environ["PYTHONIOENCODING"] = "utf-8"
     print("Warning: no .env found")
+
 
 # ==========================================
 # 2. RUNTIME CONFIGURATION & CONSTANTS
@@ -69,7 +78,7 @@ def wait_for_service(name: str, port: int, timeout: int) -> tuple[str, bool]:
     Repeatedly pings a microservice health endpoint until it responds with a 200 OK
     or hits the predefined timeout ceiling.
     """
-    url = f"http://localhost:{port}/health"
+    url = f"http://127.0.0.1:{port}/health"
     deadline = time.time() + timeout
     
     while time.time() < deadline:
@@ -77,14 +86,15 @@ def wait_for_service(name: str, port: int, timeout: int) -> tuple[str, bool]:
             # Short 1.5-second socket timeout to prevent a lagging endpoint from stalling the thread
             with urllib.request.urlopen(url, timeout=1.5) as r:
                 if r.status == 200:
-                    print(f" ✓ {name:<15} healthy")
+                    print(f" ✓ {name:<15} healthy", flush=True)
                     return name, True
         except Exception:
             # Any HTTP Error or Connection Error means the service is still booting up
             pass
         time.sleep(1)
         
-    print(f" ⚠ {name:<15} health check timed out after {timeout}s")
+    print(f" ⚠ {name:<15} health check timed out after {timeout}s", flush=True)
+
     return name, False
 
 # ==========================================
@@ -143,8 +153,10 @@ def main():
             print(f" Starting {name} on port {port}...")
             p = subprocess.Popen(
                 ["uvicorn", app, "--host", "0.0.0.0", "--port", str(port), "--reload"],
-                creationflags=PO_FLAGS
+                creationflags=PO_FLAGS,
+                env=dict(os.environ),
             )
+
             # Track process objects for monitoring and teardown
             processes.append((name, p, port))
 

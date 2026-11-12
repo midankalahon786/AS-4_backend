@@ -1,184 +1,83 @@
-# src/notifications/worker.py
 """
-Background Email + Slack Worker
-════════════════════════════════
-Architecture: DB polling → Redis queue (BLPOP)
-
-Key fixes vs original:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. AT-MOST-ONCE DELIVERY (fixes duplicate emails on restart)
-   - Mark email_sent=True in DB BEFORE sending email/Slack.
-   - If the send fails, revert email_sent=False so recovery can retry.
-   - Prevents the race: "process crashes between send() and mark_sent()"
-     from causing duplicates.
-
-2. REDIS CLAIM LOCK (fixes duplicate processing across instances / rapid restarts)
-   - Before processing any notification, atomically SET a Redis key with NX+EX.
-   - If the key already exists, another worker instance claimed it — skip silently.
-   - Lock TTL = 10 minutes (well beyond any reasonable SMTP timeout).
-
-3. SAFE RECOVERY WINDOW (fixes re-queuing of in-flight notifications)
-   - Recovery query excludes notifications created in the last 5 minutes.
-   - Notifications that young were likely mid-processing when the server died.
-   - They are covered by the claim lock anyway, but this avoids unnecessary
-     re-queuing noise.
-
-4. RETRY CAP (fixes infinite re-queue loop when sending keeps failing)
-   - _mark_email_unsent now increments a send_attempts counter.
-   - _recover_pending skips rows that have already failed 3+ times.
-   - Those rows are left with email_sent=False for manual inspection.
-
-5. CELEBRATION ROWS SKIPPED IN REGULAR QUEUE (fixes duplicate celebration emails)
-   - Celebration notification rows are enqueued via create_notification like any
-     other row, but they are fully managed by the celebration worker.
-   - _process_one now detects type==CELEBRATION and marks the row sent without
-     sending any email, so the regular worker never double-delivers them.
-
-6. ONE-SHOT RECOVERY PER DAY (fixes re-queuing on every restart)
-   - _recover_pending checks/sets the notify:recovery_done Redis key.
-   - Subsequent restarts within the same 24-hour window skip recovery.
-   - The key expires automatically so recovery runs fresh each day.
-
-7. CELEBRATION DEDUP IS UNCHANGED — sentinel written before broadcast loop
-   is the correct guard. The at-most-once fix above also applies to
-   individual celebration notification rows.
-
-8. APSCHEDULER REPLACES celebration_worker_loop (fixes multi-instance duplicates)
-   - celebration_worker_loop removed entirely.
-   - _process_celebrations is now a plain async function called by APScheduler
-     via RedisJobStore — only ONE pod fires the job even across many instances.
-   - Scheduler is set up in lifespan.py.
-
-9. SMTP RATE LIMITING (fixes SMTP provider throttling / blacklisting at scale)
-   - _notify_recipient now throttles to EMAILS_PER_SECOND.
-   - Prevents hitting SendGrid / SES per-second limits on large broadcasts.
+src/notifications/worker.py
+───────────────────────────
+Background Email + Slack Worker.
+Operates on SQLAlchemy 2.0 async sessionmaker with Redis BLPOP queueing[cite: 46].
 """
+from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from opentelemetry import trace
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 if TYPE_CHECKING:
-    from prisma import Prisma
-    from .email_sender import EmailSender
-    from .slack_sender import SlackSender
+    from src.notifications.email_sender import EmailSender
+    from src.notifications.slack_sender import SlackSender
 
 import redis.asyncio as aioredis
 
-from .cache import (
+from src.notifications.cache import (
     QUEUE_KEY,
     dequeue_notification,
-    get_cached_employee,
-    set_cached_employee,
     get_cached_celebration_employees,
-    set_cached_celebration_employees,
+    get_cached_employee,
     get_cached_slack_uid,
+    set_cached_celebration_employees,
+    set_cached_employee,
     set_cached_slack_uid,
 )
+from src.notifications.repository import SQLAlchemyNotificationRepository
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
-# How long a claim lock is held in Redis.
-# Must be longer than the worst-case send time (SMTP + Slack combined).
-_CLAIM_TTL_SECONDS = 600  # 10 minutes
-
-# Notifications younger than this are assumed to be mid-processing from the
-# previous server run and are excluded from startup recovery re-queuing.
-_RECOVERY_GRACE_SECONDS = 300  # 5 minutes
-
-# Maximum number of send attempts before a notification is abandoned.
-# Rows that hit this cap are left with email_sent=False for manual inspection.
+_CLAIM_TTL_SECONDS = 600  # 10 minutes[cite: 46]
+_RECOVERY_GRACE_SECONDS = 300  # 5 minutes[cite: 46]
 _MAX_SEND_ATTEMPTS = 3
-
-# Redis key that gates one-shot recovery per 24-hour window.
 _RECOVERY_DONE_KEY = "notify:recovery_done"
-
-# SMTP rate limit — emails sent per second during celebration broadcasts.
-# Stay well under SendGrid (100/s) and SES (14/s) default limits.
-# Set conservatively; increase once you confirm your provider's limits.
 EMAILS_PER_SECOND = 10
 
 
-# ── Claim lock ────────────────────────────────────────────────────────────────
+# ── Claim Lock ────────────────────────────────────────────────────────────────
 
 async def _try_claim(r: aioredis.Redis, notification_id: str) -> bool:
-    """
-    Atomically claim a notification for processing.
-
-    Uses SET NX EX — the claim succeeds only if no other worker instance
-    has already set this key. Returns True if this worker owns it.
-
-    The lock is intentionally NOT released after processing — it expires
-    naturally after _CLAIM_TTL_SECONDS. This prevents a slow second worker
-    from re-processing a notification that the first worker already finished.
-
-    Raw r.set() used intentionally — requires NX atomicity not available
-    in cache helpers.
-    """
+    """Atomically claim notification via SET NX EX[cite: 46]."""
     key = f"processing:{notification_id}"
     try:
         result = await r.set(key, "1", nx=True, ex=_CLAIM_TTL_SECONDS)
         return result is True
     except Exception as exc:
-        # If Redis is unavailable, allow processing to continue — the DB
-        # email_sent flag is the fallback dedup guard.
         logger.warning("_try_claim(%s) Redis error — proceeding without lock: %s", notification_id, exc)
         return True
 
 
-# ── Startup recovery ──────────────────────────────────────────────────────────
+# ── Startup Recovery ──────────────────────────────────────────────────────────
 
-async def _recover_pending(db: "Prisma", r: aioredis.Redis) -> int:
-    """
-    On startup, find notifications that were never sent and re-queue them.
-
-    Checks notify:recovery_done before doing anything. If the key exists
-    (set within the last 24h), recovery is skipped entirely.
-    This prevents every restart from re-queuing the same notifications.
-
-    Excludes rows whose send_attempts >= _MAX_SEND_ATTEMPTS so
-    persistently-failing notifications do not loop forever.
-
-    Excludes notifications younger than _RECOVERY_GRACE_SECONDS — those
-    were likely mid-processing when the previous instance died and will be
-    handled by the claim lock if a duplicate somehow arrives.
-
-    Runs once per worker startup (gated by notify:recovery_done).
-
-    Raw r.exists() / r.set() used intentionally — process-coordination
-    flags, not cached data. L1/L2 cache helpers are not appropriate here.
-    """
+async def _recover_pending(
+    session_factory: async_sessionmaker[AsyncSession], r: aioredis.Redis
+) -> int:
     with tracer.start_as_current_span("worker_startup_recovery") as span:
-
         try:
             already_done = await r.exists(_RECOVERY_DONE_KEY)
         except Exception:
-            already_done = False  # Redis unavailable — run recovery anyway
+            already_done = False
 
         if already_done:
             logger.info("Worker recovery: notify:recovery_done key present — skipping recovery.")
             span.set_attribute("recovery.skipped", True)
             return 0
 
-        cutoff_upper = datetime.now(tz=timezone.utc)
-        cutoff_lower = cutoff_upper - timedelta(seconds=_RECOVERY_GRACE_SECONDS)
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(seconds=_RECOVERY_GRACE_SECONDS)
 
-        pending = await db.notifications.find_many(
-            where={
-                "email_sent": False,
-                "type": {"not": "CELEBRATION"},
-                "send_attempts": {"lt": _MAX_SEND_ATTEMPTS},
-                "created_at": {
-                    "lt": cutoff_lower,
-                },
-            },
-            order={"created_at": "asc"},
-        )
+        async with session_factory() as session:
+            repo = SQLAlchemyNotificationRepository(session)
+            pending = await repo.get_pending_recovery_notifications(cutoff, _MAX_SEND_ATTEMPTS)
+
         span.set_attribute("recovery.pending_count", len(pending))
 
         if pending:
@@ -187,11 +86,8 @@ async def _recover_pending(db: "Prisma", r: aioredis.Redis) -> int:
                 pipe.lpush(QUEUE_KEY, str(n.notification_id))
             await pipe.execute()
             logger.info(
-                "Worker recovery: re-queued %d pending notification(s) "
-                "(older than %ds, attempts < %d)",
+                "Worker recovery: re-queued %d pending notification(s)",
                 len(pending),
-                _RECOVERY_GRACE_SECONDS,
-                _MAX_SEND_ATTEMPTS,
             )
 
         try:
@@ -202,163 +98,98 @@ async def _recover_pending(db: "Prisma", r: aioredis.Redis) -> int:
         return len(pending)
 
 
-# ── Employee / Slack UID helpers ──────────────────────────────────────────────
+# ── Employee / Slack UID Helpers ──────────────────────────────────────────────
 
-async def _get_employee(db: "Prisma", r: aioredis.Redis, employee_id: str) -> dict | None:
-    """Fetch employee with Redis L1/L2 cache. Falls back to DB on miss."""
+async def _get_employee(
+    session: AsyncSession, r: aioredis.Redis, employee_id: str
+) -> dict | None:
     cached = await get_cached_employee(r, employee_id)
     if cached:
         return cached
 
-    emp = await db.employees.find_unique(where={"employee_id": employee_id})
-    if emp is None:
-        return None
-
-    emp_dict = {
-        "employee_id": str(emp.employee_id),
-        "email": emp.email,
-        "username": emp.username,
-    }
-    await set_cached_employee(r, employee_id, emp_dict)
+    repo = SQLAlchemyNotificationRepository(session)
+    emp_dict = await repo.get_employee_minimal(UUID(employee_id))
+    if emp_dict:
+        await set_cached_employee(r, employee_id, emp_dict)
     return emp_dict
 
 
 async def _get_slack_uid(
-    slack: "SlackSender | None",
+    slack: SlackSender | None,
     r: aioredis.Redis,
     email: str,
 ) -> str | None:
-    """Slack UID lookup with 24h Redis cache. Returns None if Slack disabled."""
     if not slack:
         return None
 
     cached = await get_cached_slack_uid(r, email)
     if cached is not None:
-        return cached if cached else None  # "" = cached "not found"
+        return cached if cached else None
 
     uid = await slack.get_user_id_by_email(email)
     await set_cached_slack_uid(r, email, uid)
     return uid
 
 
-# ── Mark helpers ──────────────────────────────────────────────────────────────
-
-async def _mark_email_sent(db: "Prisma", notification_id: str) -> None:
-    await db.notifications.update(
-        where={"notification_id": notification_id},
-        data={"email_sent": True},
-    )
-
-
-async def _mark_email_unsent(db: "Prisma", notification_id: str) -> None:
-    """
-    Revert email_sent back to False so recovery can retry on next restart.
-    Called when sending fails after we already flipped the flag.
-    Also increments send_attempts so that notifications which keep
-    failing are eventually abandoned by _recover_pending after _MAX_SEND_ATTEMPTS.
-    """
-    try:
-        await db.notifications.update(
-            where={"notification_id": notification_id},
-            data={
-                "email_sent": False,
-                "send_attempts": {"increment": 1},
-            },
-        )
-    except Exception as exc:
-        logger.warning(
-            "_mark_email_unsent(%s) failed — notification may be lost: %s",
-            notification_id,
-            exc,
-        )
-
-
-# ── Core processor ────────────────────────────────────────────────────────────
+# ── Core Processor ────────────────────────────────────────────────────────────
 
 async def _process_one(
-    db: "Prisma",
-    sender: "EmailSender",
-    slack: "SlackSender | None",
+    session_factory: async_sessionmaker[AsyncSession],
+    sender: EmailSender,
+    slack: SlackSender | None,
     r: aioredis.Redis,
-    notification_id: str,
+    notification_id_str: str,
 ) -> bool:
-    from .email_sender import build_notification_html
+    from src.notifications.email_sender import build_notification_html
 
     with tracer.start_as_current_span("process_single_notification") as span:
-        span.set_attribute("notification.id", notification_id)
+        span.set_attribute("notification.id", notification_id_str)
 
-        # ── Step 1: Claim lock ────────────────────────────────────────────────
-        claimed = await _try_claim(r, notification_id)
+        # 1. Claim lock[cite: 46]
+        claimed = await _try_claim(r, notification_id_str)
         if not claimed:
             span.set_attribute("notification.status", "skipped_claim_lost")
-            logger.debug(
-                "Worker: notification %s already claimed by another instance — skipping",
-                notification_id,
-            )
             return True
 
-        # ── Step 2: Fetch from DB ─────────────────────────────────────────────
-        notification = await db.notifications.find_unique(
-            where={"notification_id": notification_id}
-        )
-        if notification is None:
-            span.set_attribute("notification.status", "not_found_in_db")
-            logger.warning(
-                "Worker: notification %s not found in DB — skipping",
-                notification_id,
-            )
-            return False
+        notif_uuid = UUID(notification_id_str)
 
-        # ── Step 3: Idempotency guard ─────────────────────────────────────────
-        if notification.email_sent:
-            span.set_attribute("notification.status", "already_sent")
-            logger.debug(
-                "Worker: notification %s already sent — skipping duplicate",
-                notification_id,
-            )
-            return True
+        async with session_factory() as session:
+            repo = SQLAlchemyNotificationRepository(session)
+            notification = await repo.get_notification_by_id(notif_uuid)
 
-        # ── Step 3b: Skip celebration rows ────────────────────────────────────
-        if notification.type == "CELEBRATION":
-            span.set_attribute("notification.status", "skipped_celebration_type")
-            logger.debug(
-                "Worker: notification %s is type CELEBRATION — "
-                "skipping regular delivery, marking sent to drain queue.",
-                notification_id,
-            )
-            await _mark_email_sent(db, notification_id)
-            return True
+            if notification is None:
+                span.set_attribute("notification.status", "not_found_in_db")
+                return False
 
-        span.set_attribute("notification.type", notification.type)
+            if notification.email_sent:
+                span.set_attribute("notification.status", "already_sent")
+                return True
 
-        # ── Step 4: Retry cap guard ───────────────────────────────────────────
-        attempts = getattr(notification, "send_attempts", 0) or 0
-        if attempts >= _MAX_SEND_ATTEMPTS:
-            span.set_attribute("notification.status", "abandoned_max_attempts")
-            logger.error(
-                "Worker: notification %s has failed %d times (max=%d) — "
-                "abandoning. Manual intervention required.",
-                notification_id,
-                attempts,
-                _MAX_SEND_ATTEMPTS,
-            )
-            return False
+            if notification.type == "CELEBRATION":
+                span.set_attribute("notification.status", "skipped_celebration_type")
+                await repo.mark_email_sent(notif_uuid)
+                await session.commit()
+                return True
 
-        # ── Step 5: Resolve employee ──────────────────────────────────────────
-        employee = await _get_employee(db, r, str(notification.employee_id))
-        if employee is None:
-            span.set_attribute("notification.status", "employee_not_found")
-            logger.warning(
-                "Worker: employee %s not found — marking sent to avoid retry loop",
-                notification.employee_id,
-            )
-            await _mark_email_sent(db, notification_id)
-            return False
+            attempts = notification.send_attempts or 0
+            if attempts >= _MAX_SEND_ATTEMPTS:
+                span.set_attribute("notification.status", "abandoned_max_attempts")
+                logger.error("Notification %s exceeded max attempts (%d)", notif_uuid, attempts)
+                return False
 
-        # ── Step 6: Claim the row in DB BEFORE sending ────────────────────────
-        await _mark_email_sent(db, notification_id)
+            emp_str = str(notification.employee_id)
+            employee = await _get_employee(session, r, emp_str)
+            if employee is None:
+                span.set_attribute("notification.status", "employee_not_found")
+                await repo.mark_email_sent(notif_uuid)
+                await session.commit()
+                return False
 
-        # ── Step 7: Send email + Slack concurrently ───────────────────────────
+            # At-most-once delivery: Claim the row before sending[cite: 46]
+            await repo.mark_email_sent(notif_uuid)
+            await session.commit()
+
+        # Send email + Slack outside the DB transaction
         try:
             html = build_notification_html(
                 title=notification.title,
@@ -373,7 +204,7 @@ async def _process_one(
                         subject=notification.title,
                         body_html=html,
                         type_=notification.type,
-                        employee_id=str(notification.employee_id),
+                        employee_id=emp_str,
                     )
 
             async def _slack_coro() -> None:
@@ -388,11 +219,7 @@ async def _process_one(
                                 type_=notification.type,
                             )
                 except Exception:
-                    logger.warning(
-                        "Worker: Slack DM failed for notification %s — "
-                        "email delivery unaffected",
-                        notification_id,
-                    )
+                    logger.warning("Slack DM failed for notification %s", notification_id_str)
 
             await asyncio.gather(_email_coro(), _slack_coro())
             span.set_attribute("notification.status", "success")
@@ -401,47 +228,32 @@ async def _process_one(
         except Exception as e:
             span.record_exception(e)
             span.set_attribute("notification.status", "failed")
-            logger.exception(
-                "Worker: failed to send notification %s — reverting email_sent flag "
-                "(attempt %d/%d)",
-                notification_id,
-                attempts + 1,
-                _MAX_SEND_ATTEMPTS,
-            )
-            await _mark_email_unsent(db, notification_id)
+            logger.exception("Failed to send notification %s — reverting flag", notification_id_str)
+            async with session_factory() as revert_session:
+                revert_repo = SQLAlchemyNotificationRepository(revert_session)
+                await revert_repo.mark_email_unsent(notif_uuid)
+                await revert_session.commit()
             return False
 
 
-# ── Email worker loop ─────────────────────────────────────────────────────────
+# ── Worker Loops ──────────────────────────────────────────────────────────────
 
 async def email_worker_loop(
-    db: "Prisma",
-    sender: "EmailSender",
+    session_factory: async_sessionmaker[AsyncSession],
+    sender: EmailSender,
     r: aioredis.Redis,
-    slack: "SlackSender | None" = None,
+    slack: SlackSender | None = None,
 ) -> None:
-    """
-    Main worker loop.
-
-    1. Startup: recover notifications missed while the process was down.
-       Gated by notify:recovery_done so it runs at most once per 24h.
-    2. Loop: BLPOP — blocks until a notification_id arrives in the queue.
-       Zero DB queries when the queue is idle.
-    """
-    recovered = await _recover_pending(db, r)
-    logger.info(
-        "Email worker started — BLPOP mode (recovered=%d, queue=%s)",
-        recovered,
-        QUEUE_KEY,
-    )
+    recovered = await _recover_pending(session_factory, r)
+    logger.info("Email worker started — BLPOP mode (recovered=%d, queue=%s)", recovered, QUEUE_KEY)
 
     while True:
         try:
             notification_id = await dequeue_notification(r, timeout=5)
             if notification_id is None:
-                continue  # timeout — loop back and block again
+                continue
 
-            success = await _process_one(db, sender, slack, r, notification_id)
+            success = await _process_one(session_factory, sender, slack, r, notification_id)
             if success:
                 logger.info("Worker: processed notification %s", notification_id)
 
@@ -449,230 +261,126 @@ async def email_worker_loop(
             logger.info("Email worker shutting down.")
             raise
         except Exception:
-            logger.exception("Email worker: unexpected error")
+            logger.exception("Email worker unexpected error")
             await asyncio.sleep(2)
 
 
-# ── Celebration processor (called by APScheduler — NOT a loop) ───────────────
+# ── Celebration Processor (APScheduler Entry) ─────────────────────────────────
 
 async def process_celebrations(
-    db: "Prisma",
-    sender: "EmailSender",
+    session_factory: async_sessionmaker[AsyncSession],
+    sender: EmailSender,
     r: aioredis.Redis,
-    slack: "SlackSender | None" = None,
+    slack: SlackSender | None = None,
 ) -> None:
-    """
-    Fire-and-forget celebration processor.
-
-    This is NOT a loop. It is called by APScheduler at midnight every day
-    via RedisJobStore — only ONE pod fires it even across many instances.
-
-    RedisJobStore acts as a distributed lock so only one scheduler instance
-    runs the job at the cron time. The Redis sentinel in _process_celebrations
-    is the secondary dedup guard if the scheduler somehow fires twice.
-
-    SMTP rate limiting: emails are sent in batches of EMAILS_PER_SECOND
-    with a 1-second pause between batches to avoid hitting SMTP provider
-    rate limits (SendGrid, SES etc.) at scale.
-    """
-    from .email_sender import build_celebration_html
-    from .service import NotificationService
-    from .schemas import NotificationType
+    from src.notifications.email_sender import build_celebration_html
+    from src.notifications.schemas import NotificationType
+    from src.notifications.service import NotificationService
 
     with tracer.start_as_current_span("check_daily_celebrations") as main_span:
-        svc = NotificationService(db, redis=r)
-        celebrants = await svc.get_employees_with_celebrations_today()
-        main_span.set_attribute("celebrants.count", len(celebrants))
+        async with session_factory() as session:
+            repo = SQLAlchemyNotificationRepository(session)
+            svc = NotificationService(repo=repo, redis=r)
+            celebrants = await svc.get_employees_with_celebrations_today()
+            main_span.set_attribute("celebrants.count", len(celebrants))
 
-        if not celebrants:
-            logger.debug("Celebration worker: no celebrations today.")
-            return
+            if not celebrants:
+                logger.debug("Celebration worker: no celebrations today.")
+                return
 
-        all_active_employees = await _get_all_active_employees_cached(db, r)
-        if not all_active_employees:
-            logger.warning("Celebration worker: no active employees found.")
-            return
+            all_active_employees = await _get_all_active_employees_cached(session, r)
+            if not all_active_employees:
+                logger.warning("Celebration worker: no active employees found.")
+                return
 
-        for person in celebrants:
-            with tracer.start_as_current_span("broadcast_celebration") as person_span:
-                person_span.set_attribute("celebrant.name", person["username"])
-                person_span.set_attribute("celebration.type", person["celebration_type"])
+            for person in celebrants:
+                emp_id = person["employee_id"]
+                c_type = person["celebration_type"]
+                username = person["username"]
 
-                try:
-                    # ── Sentinel check — primary dedup guard ──────────────────
-                    already_sent = await svc.celebration_already_sent_today(
-                        employee_id=person["employee_id"],
-                        celebration_type=person["celebration_type"],
-                    )
-                    if already_sent:
-                        person_span.set_attribute("celebration.status", "already_sent")
-                        logger.debug(
-                            "Celebration worker: sentinel found for %s %s — skipping.",
-                            person["celebration_type"],
-                            person["username"],
+                already_sent = await svc.celebration_already_sent_today(
+                    employee_id=emp_id, celebration_type=c_type
+                )
+                if already_sent:
+                    continue
+
+                # Write sentinel FIRST before sending[cite: 46]
+                await svc.create_sentinel(
+                    employee_id=emp_id,
+                    celebration_type=c_type,
+                    celebrant_name=username,
+                )
+                await session.commit()
+
+                personal_subject, personal_html = build_celebration_html(
+                    employee_name=username,
+                    celebration_type=c_type,
+                    years=person.get("years"),
+                    is_personal=True,
+                )
+                broadcast_subject, broadcast_html = build_celebration_html(
+                    employee_name=username,
+                    celebration_type=c_type,
+                    years=person.get("years"),
+                    is_personal=False,
+                )
+                broadcast_plain = (
+                    f"[{c_type}] Today is {username}'s birthday! Wish them a great day."
+                    if c_type == "BIRTHDAY"
+                    else f"[{c_type}] {username} is celebrating their {person.get('years')}-year work anniversary today."
+                )
+
+                # Slack Broadcast
+                if slack:
+                    asyncio.create_task(
+                        slack.send_celebration(
+                            channel_id=None,
+                            employee_name=username,
+                            celebration_type=c_type,
+                            years=person.get("years"),
                         )
-                        continue
-
-                    # Write sentinel FIRST — before any email or notification row
-                    await svc.create_sentinel(
-                        employee_id=person["employee_id"],
-                        celebration_type=person["celebration_type"],
-                        celebrant_name=person["username"],
                     )
 
-                    personal_subject, personal_html = build_celebration_html(
-                        employee_name=person["username"],
-                        celebration_type=person["celebration_type"],
-                        years=person.get("years"),
-                        is_personal=True,
+                # Rate-limited email broadcast[cite: 46]
+                for i, recipient in enumerate(all_active_employees):
+                    is_celebrant = recipient["employee_id"] == str(emp_id)
+                    subject_to_send = personal_subject if is_celebrant else broadcast_subject
+                    html_to_send = personal_html if is_celebrant else broadcast_html
+                    plain_to_send = (
+                        f"[{c_type}] Happy {c_type.replace('_', ' ').title()}, {username}!"
+                        if is_celebrant
+                        else broadcast_plain
                     )
-                    broadcast_subject, broadcast_html = build_celebration_html(
-                        employee_name=person["username"],
-                        celebration_type=person["celebration_type"],
-                        years=person.get("years"),
-                        is_personal=False,
+
+                    notif = await svc.create_notification(
+                        employee_id=recipient["employee_id"],
+                        title=subject_to_send,
+                        message=plain_to_send,
+                        type=NotificationType.CELEBRATION,
                     )
-                    broadcast_plain = _celebration_plain_message(person)
+                    await repo.mark_email_sent(notif["notification_id"])
+                    await session.commit()
 
-                    # ── Slack broadcast (non-blocking, non-fatal) ─────────────
-                    async def _slack_broadcast() -> None:
-                        if not slack:
-                            return
-                        try:
-                            await slack.send_celebration(
-                                channel_id=None,
-                                employee_name=person["username"],
-                                celebration_type=person["celebration_type"],
-                                years=person.get("years"),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Celebration worker: Slack broadcast failed for %s",
-                                person["username"],
-                            )
-
-                    asyncio.create_task(_slack_broadcast())
-
-                    # ── Rate-limited email broadcast ──────────────────────────
-                    async def _notify_recipient(recipient: dict) -> bool:
-                        is_celebrant = recipient["employee_id"] == str(person["employee_id"])
-                        subject_to_send = personal_subject if is_celebrant else broadcast_subject
-                        html_to_send    = personal_html    if is_celebrant else broadcast_html
-                        plain_to_send   = (
-                            (
-                                f"[{person['celebration_type']}] Happy "
-                                f"{person['celebration_type'].replace('_', ' ').title()}, "
-                                f"{person['username']}!"
-                            )
-                            if is_celebrant
-                            else broadcast_plain
+                    try:
+                        await sender.send_notification_email(
+                            to_email=recipient["email"],
+                            subject=subject_to_send,
+                            body_html=html_to_send,
                         )
+                    except Exception:
+                        await repo.mark_email_unsent(notif["notification_id"])
+                        await session.commit()
 
-                        try:
-                            notification = await svc.create_notification(
-                                employee_id=recipient["employee_id"],
-                                title=subject_to_send,
-                                message=plain_to_send,
-                                type=NotificationType.CELEBRATION,
-                            )
-                            notif_id = str(notification["notification_id"])
-
-                            await _mark_email_sent(db, notif_id)
-                            try:
-                                await sender.send_notification_email(
-                                    to_email=recipient["email"],
-                                    subject=subject_to_send,
-                                    body_html=html_to_send,
-                                )
-                            except Exception:
-                                await _mark_email_unsent(db, notif_id)
-                                raise
-                            return True
-                        except Exception:
-                            logger.exception(
-                                "Celebration worker: failed to notify %s about %s's %s",
-                                recipient["employee_id"],
-                                person["username"],
-                                person["celebration_type"],
-                            )
-                            return False
-
-                    # Send in rate-limited batches
-                    success_count = 0
-                    for i, recipient in enumerate(all_active_employees):
-                        ok = await _notify_recipient(recipient)
-                        if ok:
-                            success_count += 1
-                        # Throttle: pause every EMAILS_PER_SECOND sends
-                        if (i + 1) % EMAILS_PER_SECOND == 0:
-                            await asyncio.sleep(1)
-
-                    person_span.set_attribute("celebration.status", "success")
-                    person_span.set_attribute("celebration.broadcast_count", success_count)
-                    logger.info(
-                        "Celebration worker: %s for %s → %d/%d employees notified",
-                        person["celebration_type"],
-                        person["username"],
-                        success_count,
-                        len(all_active_employees),
-                    )
-
-                except Exception as e:
-                    person_span.record_exception(e)
-                    person_span.set_attribute("celebration.status", "failed")
-                    logger.exception(
-                        "Celebration worker: failed to process celebration for %s",
-                        person.get("employee_id"),
-                    )
+                    if (i + 1) % EMAILS_PER_SECOND == 0:
+                        await asyncio.sleep(1)
 
 
-# ── Active employee cache helper ──────────────────────────────────────────────
+async def _get_all_active_employees_cached(session: AsyncSession, r: aioredis.Redis) -> list[dict]:
+    cached = await get_cached_celebration_employees(r)
+    if cached is not None:
+        return cached
 
-async def _get_all_active_employees_cached(db: "Prisma", r: aioredis.Redis) -> list:
-    """
-    Returns all active employees for the celebration broadcast.
-    Cached for 1h — the celebration job only runs daily anyway.
-    """
-    with tracer.start_as_current_span("fetch_active_employees_for_broadcast"):
-        cached = await get_cached_celebration_employees(r)
-        if cached is not None:
-            logger.debug(
-                "Celebration worker: active employees from cache (%d)", len(cached)
-            )
-            return cached
-
-        all_employees_raw = await db.employees.find_many(
-            include={"status_master_employees_status_idTostatus_master": True}
-        )
-        active = [
-            {
-                "employee_id": str(e.employee_id),
-                "email": e.email,
-                "username": e.username,
-            }
-            for e in all_employees_raw
-            if (
-                e.status_master_employees_status_idTostatus_master is not None
-                and e.status_master_employees_status_idTostatus_master.status_code
-                == "ACTIVE"
-            )
-        ]
-        await set_cached_celebration_employees(r, active)
-        logger.debug(
-            "Celebration worker: loaded %d active employees from DB → cached",
-            len(active),
-        )
-        return active
-
-
-# ── Plain text helper ─────────────────────────────────────────────────────────
-
-def _celebration_plain_message(person: dict) -> str:
-    name = person["username"]
-    if person["celebration_type"] == "BIRTHDAY":
-        return f"[BIRTHDAY] Today is {name}'s birthday! Wish them a great day."
-    years = person.get("years")
-    return (
-        f"[WORK_ANNIVERSARY] {name} is celebrating their {years}-year "
-        f"work anniversary today."
-    )
+    repo = SQLAlchemyNotificationRepository(session)
+    active = await repo.get_active_employee_records()
+    await set_cached_celebration_employees(r, active)
+    return active

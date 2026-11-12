@@ -1,49 +1,39 @@
 """
-src/wallet/main.py  — Wallet Service entry point.
+src/wallet/main.py — Wallet Service entry point.
+Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-# CORSMiddleware import removed
 from fastapi.responses import JSONResponse
-from prisma.errors import UniqueViolationError
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
+from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.dependencies import close_auth_client
 from src.common.middleware import (
-    generic_exception_handler, http_exception_handler,
-    prisma_unique_violation_handler, request_rate_limit_middleware,
+    generic_exception_handler,
+    http_exception_handler,
+    request_rate_limit_middleware,
     validation_exception_handler,
 )
-from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.route_registry import register_app_routes
+from src.common.telemetry import setup_telemetry
+from src.core.database import engine
 from src.notifications.redis_client import connect_redis, disconnect_redis
-from src.prisma.client import connect_with_retry, db
 from src.wallet.employee_consumer import employee_created_consumer_loop
 from src.wallet.internal_router import router as internal_router
 from src.wallet.review_consumer import review_created_consumer_loop
 from src.wallet.reward_consumer import reward_redeemed_consumer_loop
-from src.wallet.routes import router as wallet_router
+from src.wallet.router import router as wallet_router
 
-import logging
 logger = logging.getLogger(__name__)
-
-resource      = Resource.create({"service.name": "rnr-wallet"})
-provider      = TracerProvider(resource=resource)
-otlp_exporter = OTLPSpanExporter()
-provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-trace.set_tracer_provider(provider)
 
 ROLE_OVERRIDES = {
     "GET:/aabhar/v1/wallets/employees/{employee_id}":       ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
@@ -64,8 +54,13 @@ ROUTE_TITLES = {
     "POST:/aabhar/v1/wallets/transactions":                  "Create Transaction",
 }
 
-cors_origins_str     = os.getenv("FRONTEND_CORS_ORIGINS", "")
-allowed_origins_list = [o.strip() for o in cors_origins_str.split(",") if o.strip()]
+
+async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+    """Handles reference number collisions or duplicate wallet records."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "A database constraint was violated. A transaction with this reference number already exists."},
+    )
 
 
 def _make_consumer_task(
@@ -76,11 +71,8 @@ def _make_consumer_task(
 ) -> asyncio.Task:
     """
     Create a consumer task with a done-callback that:
-    - Logs any unhandled exception so silent crashes are visible
-    - Auto-restarts the consumer after a 3-second delay if it crashes
-      (unless shutdown is in progress)
-    This prevents the "works only after restart" symptom caused by the
-    task dying silently and only recovering via _recover_pending on next boot.
+    - Logs any unhandled exception so silent crashes are visible[cite: 29]
+    - Auto-restarts the consumer after a 3-second delay if it crashes[cite: 29]
     """
     task = asyncio.create_task(loop_fn(shutdown_event), name=name)
 
@@ -95,7 +87,6 @@ def _make_consumer_task(
                     await asyncio.sleep(3)
                     if not shutdown_event.is_set():
                         new_task = _make_consumer_task(loop_fn, shutdown_event, name, consumer_tasks)
-                        # Replace the dead task reference in the shared list
                         for i, old in enumerate(consumer_tasks):
                             if old is t:
                                 consumer_tasks[i] = new_task
@@ -114,12 +105,15 @@ def _make_consumer_task(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_with_retry()
-    print("Wallet Service: 🟢 Database Connected")
+    # 1. Connect and verify PostgreSQL via SQLAlchemy
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    print("Wallet Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
-    _shutdown      = asyncio.Event()
+    _shutdown = asyncio.Event()
     consumer_tasks = []
 
+    # 2. Redis and stream consumers
     try:
         await connect_redis()
         print("Wallet Service: ☑️  Redis Connected")
@@ -130,15 +124,13 @@ async def lifespan(app: FastAPI):
             _make_consumer_task(reward_redeemed_consumer_loop,  _shutdown, "reward_redeemed_consumer",  consumer_tasks),
         ])
 
-        # Yield to the event loop so all three consumer tasks actually start
-        # running before lifespan continues. Without this, tasks are scheduled
-        # but not yet executing — their first xreadgroup call hasn't happened yet.
+        # Yield to the event loop so all consumer tasks start execution
         await asyncio.sleep(0)
-
         print("Wallet Service: 👂 Stream consumers started")
     except Exception as exc:
         print(f"Wallet Service: ⚠️  Redis unavailable ({exc}) — consumers disabled")
 
+    # 3. Dynamic route registration
     await register_app_routes(
         app,
         default_roles=["SUPER_ADMIN", "HR_ADMIN"],
@@ -148,6 +140,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean shutdown
     _shutdown.set()
     for task in consumer_tasks:
         task.cancel()
@@ -159,8 +152,8 @@ async def lifespan(app: FastAPI):
 
     await close_auth_client()
     await disconnect_redis()
-    await db.disconnect()
-    print("Wallet Service: 🔴 Database Disconnected")
+    await engine.dispose()
+    print("Wallet Service: 🔴 Database Disconnected & Pool Disposed")
 
 
 app = FastAPI(
@@ -175,12 +168,13 @@ app = FastAPI(
 
 initialize_cors_and_middleware(app)
 
+
 @app.get("/health", tags=["System"])
 async def health_check():
     return {"status": "healthy", "service": "Wallet Service"}
 
 
-# Deprecated route remains for signal consistency
+# Deprecated route remains for signal consistency[cite: 29]
 @app.post("/credit-from-review", include_in_schema=False)
 async def credit_from_review_deprecated():
     return JSONResponse(status_code=410, content={
@@ -190,17 +184,18 @@ async def credit_from_review_deprecated():
 
 # Middleware & Exception Handlers
 app.middleware("http")(request_rate_limit_middleware)
-app.add_exception_handler(Exception,               generic_exception_handler)
+app.add_exception_handler(IntegrityError,         sqlalchemy_integrity_error_handler)
+app.add_exception_handler(HTTPException,          http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(HTTPException,           http_exception_handler)
-app.add_exception_handler(UniqueViolationError,    prisma_unique_violation_handler)
+app.add_exception_handler(Exception,              generic_exception_handler)
 
-# CORS MIDDLEWARE REMOVED FROM HERE
-
+# Routers
 app.include_router(wallet_router)
 app.include_router(internal_router)
 
 # Instrumentation
-FastAPIInstrumentor.instrument_app(
-    app, excluded_urls="health,docs,openapi.json,redoc,internal"
-)
+setup_telemetry(app, "rnr-wallet", excluded_urls="health,docs,openapi.json,redoc,internal")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.wallet.main:app", host="0.0.0.0", port=8006, reload=True)

@@ -1,110 +1,164 @@
-# src/roles/router.py
-#
-# Route paths registered here are BARE paths (no /aabhar/v1/roles prefix).
-# route_registry builds the full DB key as:
-#   f"{METHOD}:{app.root_path}{route.path}"
-#   e.g.  GET  +  /aabhar/v1/roles  +  /list  =  GET:/aabhar/v1/roles/list
-#
-# Your ROLE_OVERRIDES and ROUTE_TITLES in main.py MUST use those full keys.
+"""
+src/roles/router.py
+───────────────────
+API routes for role creation, employee role assignment, and dynamic route permissions.
+Powered by RoleService with SQLAlchemy 2.0 async session dependency injection.
+"""
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Any
 
-from src.common.dependencies import check_route_permission, CurrentUser, get_current_user
-from src.roles.schemas import (
-    CreateRoleRequest,
-    AssignRoleRequest,
-    RevokeRoleRequest,
-    SetRoutePermissionRequest,
-    DeleteRoutePermissionRequest,
-    UpdateRouteTitleRequest,
-)
-import src.roles.service as service
+from fastapi import APIRouter, Depends, Request, status
+
+from src.common.dependencies import CurrentUser, check_route_permission, get_current_user
+from src.roles import schemas
+from src.roles.dependencies import get_role_service
+from src.roles.service import RoleService
 
 router = APIRouter(tags=["Role Management"])
 
 
-# ── Roles ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  Roles
+# ══════════════════════════════════════════════════════════════
 
-@router.get("/list")
+@router.get(
+    "/list",
+    response_model=list[schemas.RoleResponse],
+    summary="List Roles",
+)
 async def list_roles(
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
     return await service.list_roles()
 
 
-@router.post("/create", status_code=201)
+@router.post(
+    "/create",
+    response_model=schemas.RoleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Role",
+)
 async def create_role(
-    body: CreateRoleRequest,
+    request: Request,
+    body: schemas.CreateRoleRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
-    return await service.create_role(body, current_user)
+    return await service.create_role(body, current_user, request=request)
 
 
-# ── Employee ↔ Role ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  Employee ↔ Role
+# ══════════════════════════════════════════════════════════════
 
-@router.get("/employees")
+@router.get(
+    "/employees",
+    response_model=list[dict[str, Any]],
+    summary="List Active Employee Role Assignments",
+)
 async def list_employee_roles(
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
     return await service.list_employee_roles()
 
 
-@router.post("/assign", status_code=201)
+@router.post(
+    "/assign",
+    response_model=schemas.EmployeeRoleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Assign Role to Employee",
+)
 async def assign_role(
-    body: AssignRoleRequest,
+    request: Request,
+    body: schemas.AssignRoleRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
-    return await service.assign_role(body, current_user)
+    return await service.assign_role(body, current_user, request=request)
 
 
-@router.post("/revoke")
+@router.post(
+    "/revoke",
+    response_model=schemas.EmployeeRoleResponse,
+    summary="Revoke Role from Employee",
+)
 async def revoke_role(
-    body: RevokeRoleRequest,
+    request: Request,
+    body: schemas.RevokeRoleRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_reward_service if False else get_role_service),
 ):
-    return await service.revoke_role(body, current_user)
+    return await service.revoke_role(body, current_user, request=request)
 
 
-# ── Route permissions ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  Route Permissions
+# ══════════════════════════════════════════════════════════════
 
-@router.get("/route-permissions")
+@router.get(
+    "/route-permissions",
+    response_model=list[dict[str, Any]],
+    summary="List Dynamic Route Permissions",
+)
 async def list_route_permissions(
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
     return await service.list_route_permissions()
 
 
-@router.post("/route-permissions", status_code=201)
+@router.post(
+    "/route-permissions",
+    response_model=schemas.RoutePermissionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add or Reactivate Route Permission",
+)
 async def add_route_permission(
-    body: SetRoutePermissionRequest,
+    request: Request,
+    body: schemas.SetRoutePermissionRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
-    return await service.add_route_permission(body, current_user)
+    return await service.add_route_permission(body, current_user, request=request)
 
 
-@router.patch("/route-permissions")
+@router.patch(
+    "/route-permissions",
+    summary="Remove Route Permission",
+)
 async def remove_route_permission(
-    body: DeleteRoutePermissionRequest,
+    request: Request,
+    body: schemas.DeleteRoutePermissionRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
-    return await service.remove_route_permission(body, current_user)
+    return await service.remove_route_permission(body, current_user, request=request)
 
 
-@router.patch("/route-permissions/title")
+@router.patch(
+    "/route-permissions/title",
+    summary="Update Route Display Title",
+)
 async def update_route_title(
-    body: UpdateRouteTitleRequest,
+    request: Request,
+    body: schemas.UpdateRouteTitleRequest,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RoleService = Depends(get_role_service),
 ):
-    """Set or update the human-readable display title for a route key."""
-    return await service.update_route_title(body, current_user)
+    return await service.update_route_title(body, current_user, request=request)
 
 
-@router.get("/my-permissions")
+@router.get(
+    "/my-permissions",
+    response_model=list[str],
+    summary="Get Accessible Route Keys for Current User",
+)
 async def get_my_permissions(
-    current_user: CurrentUser = Depends(get_current_user), 
+    current_user: CurrentUser = Depends(get_current_user),
+    service: RoleService = Depends(get_role_service),
 ):
-    """
-    Returns a list of route_keys the current user has access to.
-    Used by the frontend Navbar to toggle the Control Panel visibility.
-    """
+    """Returns route keys available to the current user to configure client-side navigation."""
     return await service.get_my_permissions(current_user)

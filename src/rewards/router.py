@@ -1,19 +1,20 @@
-# src/rewards/router.py
+"""
+src/rewards/router.py
+─────────────────────
+API routes for reward categories, catalog, stock management, and redemptions.
+Powered by RewardService with SQLAlchemy 2.0 async session dependency injection.
+"""
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, status, HTTPException, Query
-from typing import List, Optional
-from prisma import Prisma
-from pydantic import UUID4
-from src.prisma.client import db
+from uuid import UUID
 
-from . import schemas, service
-from src.common.dependencies import check_route_permission, CurrentUser, PaginationParams
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+
+from src.common.dependencies import CurrentUser, PaginationParams, check_route_permission
 from src.core.logger import logger
-
-
-async def get_db() -> Prisma:
-    return db
-
+from src.rewards import schemas
+from src.rewards.dependencies import get_reward_service
+from src.rewards.service import RewardService
 
 COMMON_ERRORS = {
     401: {"model": schemas.ErrorResponse, "description": "Bearer token missing or expired"},
@@ -27,164 +28,270 @@ router = APIRouter(
 )
 
 
-# --- CATEGORY ENDPOINTS ---
+# ══════════════════════════════════════════════════════════════
+#  CATEGORY ENDPOINTS
+# ══════════════════════════════════════════════════════════════
 
-@router.post("/categories", response_model=schemas.CategoryResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/categories",
+    response_model=schemas.CategoryResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Reward Category",
+)
 async def create_category(
     request: Request,
     body: schemas.CreateCategoryRequest,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
     """Create a new reward category."""
-    logger.info(f"User {current_user.id} requested to create category: {body.category_name}")
-    svc = service.RewardService(db)
-    return await svc.create_category(body, user_id=current_user.id, req_info=request)
+    user_id = UUID(str(current_user.id))
+    logger.info("User %s requested to create category: %s", user_id, body.category_name)
+    return await service.create_category(body, user_id=user_id, req_info=request)
 
 
-@router.patch("/categories/{category_id}", response_model=schemas.CategoryResponse)
+@router.patch(
+    "/categories/{category_id}",
+    response_model=schemas.CategoryResponse,
+    summary="Update Reward Category",
+)
 async def update_category(
-    category_id: str,
+    category_id: UUID,
     request: Request,
     body: schemas.UpdateCategoryRequest,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
     """Update a category."""
-    logger.info(f"User {current_user.id} updating category: {category_id}")
-    svc = service.RewardService(db)
-    return await svc.update_category(category_id, body, user_id=current_user.id, req_info=request)
+    user_id = UUID(str(current_user.id))
+    logger.info("User %s updating category: %s", user_id, category_id)
+    return await service.update_category(
+        category_id=category_id,
+        request=body,
+        user_id=user_id,
+        req_info=request,
+    )
 
 
-@router.get("/categories", response_model=List[schemas.CategoryResponse])
+@router.get(
+    "/categories",
+    response_model=list[schemas.CategoryResponse],
+    summary="List Reward Categories",
+)
 async def get_categories(
-    is_active: Optional[bool] = None,
-    db: Prisma = Depends(get_db),
+    is_active: bool | None = None,
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    logger.debug(f"User {current_user.id} fetching categories. is_active: {is_active}")
-    svc = service.RewardService(db)
-    return await svc.get_categories(is_active=is_active)
+    """Fetch categories with optional active status filter."""
+    logger.debug("User %s fetching categories. is_active: %s", current_user.id, is_active)
+    return await service.get_categories(is_active=is_active)
 
 
-# --- CATALOG ENDPOINTS ---
+# ══════════════════════════════════════════════════════════════
+#  CATALOG ENDPOINTS
+# ══════════════════════════════════════════════════════════════
 
-@router.post("/catalog", response_model=schemas.RewardItemResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/catalog",
+    response_model=schemas.RewardItemResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Catalog Item",
+)
 async def create_reward_item(
     request: Request,
     item: schemas.CreateRewardRequest,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    logger.info(f"Admin {current_user.id} creating reward item: {item.reward_code}")
-    svc = service.RewardService(db)
-    return await svc.create_item(item, user_id=current_user.id, req_info=request)
+    user_id = UUID(str(current_user.id))
+    logger.info("Admin %s creating reward item: %s", user_id, item.reward_code)
+    return await service.create_item(item, user_id=user_id, req_info=request)
 
 
-@router.patch("/catalog/{catalog_id}", response_model=schemas.RewardItemResponse)
+@router.patch(
+    "/catalog/{catalog_id}",
+    response_model=schemas.RewardItemResponse,
+    summary="Update Catalog Item",
+)
 async def update_reward_item(
-    catalog_id: str,
+    catalog_id: UUID,
     request: Request,
     body: schemas.UpdateRewardRequest,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    logger.info(f"Admin {current_user.id} updating catalog item: {catalog_id}")
-    svc = service.RewardService(db)
-    return await svc.update_item(catalog_id, body, user_id=current_user.id, req_info=request)
-
-
-@router.get("/catalog", response_model=schemas.PaginatedCatalogResponse)
-async def view_catalog(
-    is_active: Optional[bool] = Query(None, description="True=Active, False=Archived, Null=All"),
-    pagination: PaginationParams = Depends(),
-    db: Prisma = Depends(get_db),
-    current_user: CurrentUser = Depends(check_route_permission),
-):
-    """View the catalog with pagination and nested category details."""
-    logger.debug(f"User {current_user.id} viewing catalog page {pagination.page}")
-    svc = service.RewardService(db)
-    return await svc.get_catalog(
-        is_active=is_active,
-        page=pagination.page,
-        size=pagination.size
+    user_id = UUID(str(current_user.id))
+    logger.info("Admin %s updating catalog item: %s", user_id, catalog_id)
+    return await service.update_item(
+        catalog_id=catalog_id,
+        request=body,
+        user_id=user_id,
+        req_info=request,
     )
 
 
-@router.patch("/catalog/{catalog_id}/stock", response_model=schemas.RewardItemResponse)
+@router.get(
+    "/catalog",
+    response_model=schemas.PaginatedCatalogResponse,
+    summary="View Reward Catalog",
+)
+async def view_catalog(
+    is_active: bool | None = Query(None, description="True=Active, False=Archived, Null=All"),
+    pagination: PaginationParams = Depends(),
+    current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
+):
+    """View the catalog with pagination and nested category details."""
+    logger.debug("User %s viewing catalog page %s", current_user.id, pagination.page)
+    return await service.get_catalog(
+        is_active=is_active,
+        page=pagination.page,
+        size=pagination.size,
+    )
+
+
+@router.patch(
+    "/catalog/{catalog_id}/stock",
+    response_model=schemas.RewardItemResponse,
+    summary="Add Stock",
+)
 async def restock_item(
-    catalog_id: str,
+    catalog_id: UUID,
     body: schemas.AddStockRequest,
     request: Request,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
     """Adds stock to an existing reward item."""
-    logger.info(f"User {current_user.id} restocking item {catalog_id} with {body.amount} units")
-    svc = service.RewardService(db)
-    return await svc.add_stock(catalog_id, body, current_user.id, request)
+    user_id = UUID(str(current_user.id))
+    logger.info("User %s restocking item %s with %d units", user_id, catalog_id, body.amount)
+    return await service.add_stock(
+        catalog_id=catalog_id,
+        request=body,
+        user_id=user_id,
+        req_info=request,
+    )
 
 
-# --- REDEMPTION ENDPOINTS ---
+# ══════════════════════════════════════════════════════════════
+#  REDEMPTION ENDPOINTS
+# ══════════════════════════════════════════════════════════════
 
-@router.post("/redeem", response_model=schemas.RedemptionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/redeem",
+    response_model=schemas.RedemptionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Redeem Reward Item",
+)
 async def redeem_reward(
     request: Request,
     body: schemas.RedeemRewardRequest,
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    logger.info(f"User {current_user.id} attempting to redeem catalog item {body.catalog_id}")
-    svc = service.RewardService(db)
+    user_id = UUID(str(current_user.id))
+    logger.info("User %s attempting to redeem catalog item %s", user_id, body.catalog_id)
 
-    wallet_id = await svc.get_wallet_id_for_user(current_user.id)
+    wallet_id = await service.get_wallet_id_for_user(user_id)
     if not wallet_id:
-        raise HTTPException(status_code=404, detail="Wallet not found for the authenticated user.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Wallet not found for the authenticated user.",
+        )
 
-    return await svc.grant_reward(
+    return await service.grant_reward(
         wallet_id=wallet_id,
         request=body,
-        granted_by_user_id=current_user.id,
-        req_info=request,          # ← ADDED: was missing, caused NULL ip in audit + stream
+        granted_by_user_id=user_id,
+        req_info=request,
     )
 
 
-# --- REWARD HISTORY ENDPOINTS ---
+@router.post(
+    "/catalog/{catalog_id}/redeem",
+    response_model=schemas.RedemptionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Redeem Reward Item by Catalog ID",
+)
+async def redeem_reward_by_catalog_id(
+    catalog_id: UUID,
+    request: Request,
+    body: schemas.RedeemRewardRequestOptionalCatalog | None = None,
+    current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
+):
+    user_id = UUID(str(current_user.id))
+    logger.info("User %s attempting to redeem catalog item %s", user_id, catalog_id)
 
-@router.get("/history/me", response_model=schemas.PaginatedHistoryResponse)
+    wallet_id = await service.get_wallet_id_for_user(user_id)
+    if not wallet_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Wallet not found for the authenticated user.",
+        )
+
+    redeem_req = schemas.RedeemRewardRequest(
+        catalog_id=catalog_id,
+        points=body.points if body else None,
+        comment=body.comment if body else None,
+    )
+
+    return await service.grant_reward(
+        wallet_id=wallet_id,
+        request=redeem_req,
+        granted_by_user_id=user_id,
+        req_info=request,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  REWARD HISTORY ENDPOINTS
+# ══════════════════════════════════════════════════════════════
+
+@router.get(
+    "/history/me",
+    response_model=schemas.PaginatedHistoryResponse,
+    summary="My Reward History",
+)
 async def get_my_history(
     pagination: PaginationParams = Depends(),
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    svc = service.RewardService(db)
-    my_wallet_id = await svc.get_wallet_id_for_user(current_user.id)
+    user_id = UUID(str(current_user.id))
+    my_wallet_id = await service.get_wallet_id_for_user(user_id)
 
     if not my_wallet_id:
-        return {"data": [], "total_items": 0, "page": pagination.page, "size": pagination.size}
+        return schemas.PaginatedHistoryResponse(
+            data=[],
+            total_items=0,
+            page=pagination.page,
+            size=pagination.size,
+        )
 
-    return await svc.get_history(
+    return await service.get_history(
         wallet_id=my_wallet_id,
         page=pagination.page,
-        size=pagination.size
+        size=pagination.size,
     )
 
 
-@router.get("/history", response_model=schemas.PaginatedHistoryResponse)
+@router.get(
+    "/history",
+    response_model=schemas.PaginatedHistoryResponse,
+    summary="Global Reward History (Admin View)",
+)
 async def get_all_history(
-    wallet_id: Optional[UUID4] = None,
+    wallet_id: UUID | None = None,
     pagination: PaginationParams = Depends(),
-    db: Prisma = Depends(get_db),
     current_user: CurrentUser = Depends(check_route_permission),
+    service: RewardService = Depends(get_reward_service),
 ):
-    """Admin View: View history for ALL users, or filter by a specific wallet."""
-    logger.info(f"Admin {current_user.id} fetching global reward history.")
-    svc = service.RewardService(db)
-
-    safe_wallet_id = str(wallet_id) if wallet_id else None
-
-    return await svc.get_history(
-        wallet_id=safe_wallet_id,
+    """Admin View: View history for all users or filter by a specific wallet."""
+    logger.info("Admin %s fetching global reward history.", current_user.id)
+    return await service.get_history(
+        wallet_id=wallet_id,
         page=pagination.page,
-        size=pagination.size
+        size=pagination.size,
     )

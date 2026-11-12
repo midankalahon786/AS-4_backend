@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 _WALLET_URL      = os.getenv("WALLET_SERVICE_URL",      "http://localhost:8004")
 _RECOGNITION_URL = os.getenv("RECOGNITION_SERVICE_URL", "http://localhost:8005")
 _EMPLOYEES_URL   = os.getenv("EMPLOYEES_SERVICE_URL",   "http://localhost:8003")
+_ORGANIZATION_SERVICE_URL = os.getenv("ORGANIZATION_SERVICE_URL", "http://localhost:8007")
+_ROLES_SERVICE_URL        = os.getenv("ROLES_SERVICE_URL", "http://localhost:8002")
 
 # One shared client — connection pooling, keep-alive across requests
 _client = httpx.AsyncClient(
@@ -84,16 +86,19 @@ async def get_wallet_by_id(wallet_id: str) -> dict:
     return await _get(f"{_WALLET_URL}/internal/wallets/by-id/{wallet_id}")
 
 
-async def get_wallet_stats(employee_id: str) -> dict:
+async def get_wallet_stats(employee_id: str | None = None) -> dict:
     """
-    GET /internal/wallets/stats?employee_id=...
+    GET /internal/wallets/stats[?employee_id=...]
     Returns: {available_points, total_earned_points,
                pts_this_month, pts_last_month,
                rewards_total, rewards_this_month, rewards_last_month}
     """
+    params = {}
+    if employee_id:
+        params["employee_id"] = employee_id
     return await _get(
         f"{_WALLET_URL}/internal/wallets/stats",
-        params={"employee_id": employee_id},
+        params=params or None,
     )
 
 
@@ -121,14 +126,17 @@ async def get_leaderboard_data(limit: int = 10) -> list:
 
 # ── Recognition service internal endpoints ────────────────────────────────────
 
-async def get_review_stats(employee_id: str) -> dict:
+async def get_review_stats(employee_id: str | None = None) -> dict:
     """
-    GET /internal/reviews/stats?employee_id=...
+    GET /internal/reviews/stats[?employee_id=...]
     Returns: {reviews_total, reviews_this_month, reviews_last_month}
     """
+    params = {}
+    if employee_id:
+        params["employee_id"] = employee_id
     return await _get(
         f"{_RECOGNITION_URL}/internal/reviews/stats",
-        params={"employee_id": employee_id},
+        params=params or None,
     )
 
 
@@ -146,11 +154,14 @@ async def get_review_stats_batch(employee_ids: list[str]) -> dict:
     )
 
 
-async def get_recent_reviews(employee_id: str, limit: int = 5) -> list:
-    """GET /internal/reviews/recent?employee_id=...&limit=..."""
+async def get_recent_reviews(employee_id: str | None = None, limit: int = 5) -> list:
+    """GET /internal/reviews/recent?[employee_id=...]&limit=..."""
+    params: dict[str, Any] = {"limit": limit}
+    if employee_id:
+        params["employee_id"] = employee_id
     return await _get(
         f"{_RECOGNITION_URL}/internal/reviews/recent",
-        params={"employee_id": employee_id, "limit": limit},
+        params=params,
     )
 
 
@@ -203,6 +214,29 @@ async def get_departments_with_members() -> list:
                 username, designation_name}]}]
     """
     return await _get(f"{_EMPLOYEES_URL}/internal/employees/departments-with-members")
+
+async def get_department_by_id(department_id: str) -> dict | None:
+    """GET /internal/organizations/departments/{department_id}"""
+    try:
+        return await _get(
+            f"{_ORGANIZATION_SERVICE_URL}/internal/organizations/departments/{department_id}"
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+
+
+async def get_employee_roles(employee_id: str) -> list[dict]:
+    """GET /internal/roles/employees/{employee_id}"""
+    try:
+        return await _get(
+            f"{_ROLES_SERVICE_URL}/internal/roles/employees/{employee_id}"
+        ) or []
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return []
+        raise
 
 
 async def get_employee_manager_email(employee_id: str) -> str | None:

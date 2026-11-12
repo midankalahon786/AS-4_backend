@@ -1,364 +1,313 @@
-# src/roles/service.py
-from datetime import datetime, timezone
-from fastapi import HTTPException, Request
-from typing import Optional
-
-from src.prisma.client import db
-from src.common.audit import audit_ctx
-from src.common.dependencies import CurrentUser
-from src.common.cache import (
-    cache_get, cache_set, cache_delete,
-    TTL_VOLATILE,  L1_VOLATILE,
-    TTL_MEDIUM,    L1_MEDIUM,
-    TTL_PERMANENT, L1_PERMANENT,
-)
-from src.roles.schemas import (
-    CreateRoleRequest,
-    AssignRoleRequest,
-    RevokeRoleRequest,
-    SetRoutePermissionRequest,
-    DeleteRoutePermissionRequest,
-    UpdateRouteTitleRequest,
-)
+"""
+src/roles/service.py
+────────────────────
+Role management and route permission service.
+Decoupled via IRoleRepository and PostgreSQL AsyncSession.
+"""
+from __future__ import annotations
 
 import logging
+import uuid
+from typing import Any
+from uuid import UUID
+
+from fastapi import HTTPException, Request, status
+
+from src.common.audit import audit, audit_ctx
+from src.common.cache import (
+    L1_MEDIUM,
+    L1_PERMANENT,
+    L1_VOLATILE,
+    TTL_MEDIUM,
+    TTL_PERMANENT,
+    TTL_VOLATILE,
+    cache_delete,
+    cache_get,
+    cache_set,
+)
+from src.common.dependencies import CurrentUser
+from src.roles import schemas
+from src.roles.interfaces import IRoleRepository
+
 logger = logging.getLogger(__name__)
 
-_KEY_ROLES       = "roles:list"
-_KEY_EMP_ROLES   = "roles:employees"
+_KEY_ROLES = "roles:list"
+_KEY_EMP_ROLES = "roles:employees"
 _KEY_PERMISSIONS = "roles:route_permissions"
 
 
-async def invalidate_roles():         await cache_delete(_KEY_ROLES)
-async def invalidate_employee_roles(): await cache_delete(_KEY_EMP_ROLES)
-async def invalidate_permissions():   await cache_delete(_KEY_PERMISSIONS)
+async def invalidate_roles() -> None:
+    await cache_delete(_KEY_ROLES)
 
 
-# ── Roles ─────────────────────────────────────────────────────────────────────
-
-async def list_roles():
-    cached = await cache_get(_KEY_ROLES, l1_ttl=L1_MEDIUM)
-    if cached is not None:
-        return cached
-    rows       = await db.roles.find_many(order=[{"role_name": "asc"}])
-    serialized = [r.model_dump() for r in rows]
-    await cache_set(_KEY_ROLES, serialized, ttl=TTL_MEDIUM, l1_ttl=L1_MEDIUM)
-    return serialized
+async def invalidate_employee_roles() -> None:
+    await cache_delete(_KEY_EMP_ROLES)
 
 
-async def create_role(
-    body: CreateRoleRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    role_code = body.role_code.upper()
-    existing  = await db.roles.find_first(where={"role_code": role_code})
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Role '{role_code}' already exists")
-
-    result = None
-    async with audit_ctx(
-        user_id    = current_user.id,
-        request    = request,
-        table_name = "roles",
-        record_id  = lambda: str(result.role_id),
-        operation  = "INSERT",
-        new_values = lambda: result.model_dump(),
-    ):
-        result = await db.roles.create(data={
-            "role_name":   body.role_name,
-            "role_code":   role_code,
-            "description": body.description,
-            "created_by":  current_user.id,
-            "updated_by":  current_user.id,
-            "updated_at":  datetime.now(timezone.utc),
-        })
-
-    await invalidate_roles()
-    return result
+async def invalidate_permissions() -> None:
+    await cache_delete(_KEY_PERMISSIONS)
 
 
-# ── Employee ↔ Role ───────────────────────────────────────────────────────────
+class RoleService:
+    def __init__(self, repo: IRoleRepository) -> None:
+        self.repo = repo
 
-async def list_employee_roles():
-    cached = await cache_get(_KEY_EMP_ROLES, l1_ttl=L1_VOLATILE)
-    if cached is not None:
-        return cached
+    # ── Roles ─────────────────────────────────────────────────────────────────
 
-    records = await db.employee_roles.find_many(
-        where={"is_active": True},
-        include={
-            "employees_employee_roles_employee_idToemployees": True,
-            "roles": True,
-        },
-        order=[{"assigned_at": "desc"}],
-    )
+    async def list_roles(self) -> list[schemas.RoleResponse]:
+        cached = await cache_get(_KEY_ROLES, l1_ttl=L1_MEDIUM)
+        if cached is not None:
+            return [schemas.RoleResponse(**r) for r in cached]
 
-    data = [
-        {
-            "employee_role_id": r.employee_role_id,
-            "assigned_at":      r.assigned_at.isoformat() if r.assigned_at else None,
-            "is_active":        r.is_active,
-            "employee": {
-                "id":       r.employees_employee_roles_employee_idToemployees.employee_id,
-                "username": r.employees_employee_roles_employee_idToemployees.username,
-                "email":    r.employees_employee_roles_employee_idToemployees.email,
-            },
-            "role": {
-                "id":   r.roles.role_id,
-                "name": r.roles.role_name,
-                "code": r.roles.role_code,
-            },
-        }
-        for r in records
-    ]
-    await cache_set(_KEY_EMP_ROLES, data, ttl=TTL_VOLATILE, l1_ttl=L1_VOLATILE)
-    return data
-
-
-async def assign_role(
-    body: AssignRoleRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    existing = await db.employee_roles.find_first(
-        where={"employee_id": body.employee_id, "role_id": body.role_id, "is_active": True}
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail="Employee already has this role")
-
-    result = None
-    async with audit_ctx(
-        user_id    = current_user.id,
-        request    = request,
-        table_name = "employee_roles",
-        record_id  = lambda: str(result.employee_role_id),
-        operation  = "INSERT",
-        new_values = lambda: {
-            "employee_id": body.employee_id,
-            "role_id":     body.role_id,
-            "assigned_by": current_user.id,
-        },
-    ):
-        result = await db.employee_roles.create(data={
-            "employee_id": body.employee_id,
-            "role_id":     body.role_id,
-            "assigned_by": current_user.id,
-            "created_by":  current_user.id,
-            "updated_by":  current_user.id,
-            "updated_at":  datetime.now(timezone.utc),
-        })
-
-    await invalidate_employee_roles()
-    return result
-
-
-async def revoke_role(
-    body: RevokeRoleRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    record = await db.employee_roles.find_first(
-        where={"employee_id": body.employee_id, "role_id": body.role_id, "is_active": True}
-    )
-    if not record:
-        raise HTTPException(status_code=404, detail="Active role assignment not found")
-
-    result = None
-    async with audit_ctx(
-        user_id    = current_user.id,
-        request    = request,
-        table_name = "employee_roles",
-        record_id  = str(record.employee_role_id),
-        operation  = "REVOKE",
-        old_values = {"is_active": True, "employee_id": body.employee_id, "role_id": body.role_id},
-        new_values = lambda: {"is_active": False, "revoked_by": current_user.id},
-    ):
-        result = await db.employee_roles.update(
-            where={"employee_role_id": record.employee_role_id},
-            data={
-                "is_active":  False,
-                "revoked_at": datetime.now(timezone.utc),
-                "revoked_by": current_user.id,
-                "updated_by": current_user.id,
-                "updated_at": datetime.now(timezone.utc),
-            },
+        rows = await self.repo.list_roles()
+        result = [schemas.RoleResponse.model_validate(r) for r in rows]
+        await cache_set(
+            _KEY_ROLES,
+            [r.model_dump(mode="json") for r in result],
+            ttl=TTL_MEDIUM,
+            l1_ttl=L1_MEDIUM,
         )
+        return result
 
-    await invalidate_employee_roles()
-    return result
-
-
-# ── Route permissions ─────────────────────────────────────────────────────────
-
-async def list_route_permissions():
-    cached = await cache_get(_KEY_PERMISSIONS, l1_ttl=L1_PERMANENT)
-    if cached is not None:
-        return cached
-
-    rows = await db.route_permissions.find_many(
-        where={"is_active": True},
-        include={"roles": True},
-        order=[{"route_key": "asc"}],
-    )
-
-    grouped: dict[str, dict] = {}
-    for row in rows:
-        key = row.route_key
-        if key not in grouped:
-            grouped[key] = {"route_key": key, "title": row.title, "roles": []}
-        elif row.title and not grouped[key]["title"]:
-            grouped[key]["title"] = row.title
-        grouped[key]["roles"].append({
-            "role_id":   row.role_id,
-            "role_code": row.roles.role_code,
-            "role_name": row.roles.role_name,
-        })
-
-    data = list(grouped.values())
-    await cache_set(_KEY_PERMISSIONS, data, ttl=TTL_PERMANENT, l1_ttl=L1_PERMANENT)
-    return data
-
-
-async def add_route_permission(
-    body: SetRoutePermissionRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    existing = await db.route_permissions.find_first(
-        where={"route_key": body.route_key, "role_id": body.role_id}
-    )
-
-    result = None
-    if existing:
-        if existing.is_active:
-            raise HTTPException(status_code=409, detail="Permission already exists and is active")
-        async with audit_ctx(
-            user_id    = current_user.id,
-            request    = request,
-            table_name = "route_permissions",
-            record_id  = str(existing.id),
-            operation  = "INSERT",
-            new_values = lambda: {"route_key": body.route_key, "role_id": body.role_id, "is_active": True},
-        ):
-            result = await db.route_permissions.update(
-                where={"id": existing.id},
-                data={
-                    "is_active":  True,
-                    "title":      body.title or existing.title,
-                    "updated_by": current_user.id,
-                    "updated_at": datetime.now(timezone.utc),
-                },
+    async def create_role(
+        self,
+        body: schemas.CreateRoleRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> schemas.RoleResponse:
+        user_id = UUID(str(current_user.id))
+        existing = await self.repo.get_role_by_code(body.role_code)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Role '{body.role_code}' already exists",
             )
-    else:
+
+        result = None
         async with audit_ctx(
-            user_id    = current_user.id,
-            request    = request,
-            table_name = "route_permissions",
-            record_id  = lambda: str(result.id),
-            operation  = "INSERT",
-            new_values = lambda: {"route_key": body.route_key, "role_id": body.role_id},
-        ):
-            result = await db.route_permissions.create(data={
-                "route_key":  body.route_key,
-                "role_id":    body.role_id,
-                "title":      body.title,
-                "is_active":  True,
-                "created_by": current_user.id,
-                "updated_by": current_user.id,
-                "updated_at": datetime.now(timezone.utc),
-            })
-
-    await invalidate_permissions()
-    return result
-
-
-async def remove_route_permission(
-    body: DeleteRoutePermissionRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    record = await db.route_permissions.find_first(
-        where={"route_key": body.route_key, "role_id": body.role_id, "is_active": True}
-    )
-    if not record:
-        raise HTTPException(status_code=404, detail="Active permission not found")
-
-    result = None
-    async with audit_ctx(
-        user_id    = current_user.id,
-        request    = request,
-        table_name = "route_permissions",
-        record_id  = str(record.id),
-        operation  = "DELETE",
-        old_values = {"route_key": body.route_key, "role_id": body.role_id, "is_active": True},
-        new_values = lambda: {"is_active": False},
-    ):
-        result = await db.route_permissions.update(
-            where={"id": record.id},
-            data={
-                "is_active":  False,
-                "updated_by": current_user.id,
-                "updated_at": datetime.now(timezone.utc),
+            user_id=str(user_id),
+            request=request,
+            table_name="roles",
+            record_id=lambda: str(result.role_id) if result else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
+                "role_name": body.role_name,
+                "role_code": body.role_code,
+                "reviewer_weight": body.reviewer_weight,
             },
+        ):
+            result = await self.repo.create_role(body, user_id)
+
+        await invalidate_roles()
+        return schemas.RoleResponse.model_validate(result)
+
+    # ── Employee ↔ Role ───────────────────────────────────────────────────────
+
+    async def list_employee_roles(self) -> list[dict[str, Any]]:
+        cached = await cache_get(_KEY_EMP_ROLES, l1_ttl=L1_VOLATILE)
+        if cached is not None:
+            return cached
+
+        data = await self.repo.list_active_employee_roles()
+        await cache_set(_KEY_EMP_ROLES, data, ttl=TTL_VOLATILE, l1_ttl=L1_VOLATILE)
+        return data
+
+    async def assign_role(
+        self,
+        body: schemas.AssignRoleRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> schemas.EmployeeRoleResponse:
+        user_id = UUID(str(current_user.id))
+        existing = await self.repo.get_active_assignment(
+            body.employee_id, body.role_id
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Employee already has this role",
+            )
+
+        result = None
+        async with audit_ctx(
+            user_id=str(user_id),
+            request=request,
+            table_name="employee_roles",
+            record_id=lambda: str(result.employee_role_id) if result else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
+                "employee_id": str(body.employee_id),
+                "role_id": str(body.role_id),
+                "assigned_by": str(user_id),
+            },
+        ):
+            result = await self.repo.assign_role(
+                body.employee_id, body.role_id, user_id
+            )
+
+        await invalidate_employee_roles()
+        return schemas.EmployeeRoleResponse.model_validate(result)
+
+    async def revoke_role(
+        self,
+        body: schemas.RevokeRoleRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> schemas.EmployeeRoleResponse:
+        user_id = UUID(str(current_user.id))
+        record = await self.repo.get_active_assignment(
+            body.employee_id, body.role_id
+        )
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Active role assignment not found",
+            )
+
+        result = None
+        async with audit_ctx(
+            user_id=str(user_id),
+            request=request,
+            table_name="employee_roles",
+            record_id=str(record.employee_role_id),
+            operation="REVOKE",
+            old_values={
+                "is_active": True,
+                "employee_id": str(body.employee_id),
+                "role_id": str(body.role_id),
+            },
+            new_values=lambda: {"is_active": False, "revoked_by": str(user_id)},
+        ):
+            result = await self.repo.revoke_role(
+                record.employee_role_id, user_id
+            )
+
+        await invalidate_employee_roles()
+        return schemas.EmployeeRoleResponse.model_validate(result)
+
+    # ── Route Permissions ─────────────────────────────────────────────────────
+
+    async def list_route_permissions(self) -> list[dict[str, Any]]:
+        cached = await cache_get(_KEY_PERMISSIONS, l1_ttl=L1_PERMANENT)
+        if cached is not None:
+            return cached
+
+        data = await self.repo.list_active_route_permissions()
+        await cache_set(
+            _KEY_PERMISSIONS, data, ttl=TTL_PERMANENT, l1_ttl=L1_PERMANENT
+        )
+        return data
+
+    async def add_route_permission(
+        self,
+        body: schemas.SetRoutePermissionRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> schemas.RoutePermissionResponse:
+        user_id = UUID(str(current_user.id))
+        existing = await self.repo.get_route_permission(
+            body.route_key, body.role_id
+        )
+        if existing and existing.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Permission already exists and is active",
+            )
+
+        result = None
+        async with audit_ctx(
+            user_id=str(user_id),
+            request=request,
+            table_name="route_permissions",
+            record_id=lambda: str(result.id) if result else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
+                "route_key": body.route_key,
+                "role_id": str(body.role_id),
+                "is_active": True,
+            },
+        ):
+            result = await self.repo.create_or_reactivate_permission(
+                route_key=body.route_key,
+                role_id=body.role_id,
+                title=body.title,
+                current_user_id=user_id,
+            )
+
+        await invalidate_permissions()
+        return schemas.RoutePermissionResponse(
+            permission_id=result.id,
+            route_key=result.route_key,
+            role_id=result.role_id,
+            title=result.title,
         )
 
-    await invalidate_permissions()
-    return result
+    async def remove_route_permission(
+        self,
+        body: schemas.DeleteRoutePermissionRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> dict[str, str]:
+        user_id = UUID(str(current_user.id))
+        record = await self.repo.get_route_permission(
+            body.route_key, body.role_id
+        )
+        if not record or not record.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Active permission not found",
+            )
 
+        async with audit_ctx(
+            user_id=str(user_id),
+            request=request,
+            table_name="route_permissions",
+            record_id=str(record.id),
+            operation="DELETE",
+            old_values={
+                "route_key": body.route_key,
+                "role_id": str(body.role_id),
+                "is_active": True,
+            },
+            new_values=lambda: {"is_active": False},
+        ):
+            await self.repo.deactivate_route_permission(record.id, user_id)
 
-async def update_route_title(
-    body: UpdateRouteTitleRequest,
-    current_user: CurrentUser,
-    request: Optional[Request] = None,
-):
-    rows = await db.route_permissions.find_many(where={"route_key": body.route_key})
-    if not rows:
-        raise HTTPException(status_code=404, detail="No permissions found for this route_key")
+        await invalidate_permissions()
+        return {"message": "Permission revoked successfully"}
 
-    # Title update is metadata only — one app-level audit row is enough
-    from src.common.audit import audit
-    await db.route_permissions.update_many(
-        where={"route_key": body.route_key},
-        data={
-            "title":      body.title,
-            "updated_by": current_user.id,
-            "updated_at": datetime.now(timezone.utc),
-        },
-    )
-    await audit(
-        table_name   = "route_permissions",
-        record_id    = str(rows[0].id),
-        operation    = "UPDATE",
-        performed_by = current_user.id,
-        new_values   = {"route_key": body.route_key, "title": body.title},
-        request      = request,
-    )
+    async def update_route_title(
+        self,
+        body: schemas.UpdateRouteTitleRequest,
+        current_user: CurrentUser,
+        request: Request | None = None,
+    ) -> dict[str, Any]:
+        user_id = UUID(str(current_user.id))
+        count, first_id = await self.repo.update_route_titles(
+            body.route_key, body.title, user_id
+        )
+        if count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No permissions found for this route_key",
+            )
 
-    await invalidate_permissions()
-    return {"route_key": body.route_key, "title": body.title, "updated_rows": len(rows)}
+        await audit(
+            table_name="route_permissions",
+            record_id=str(first_id),
+            operation="UPDATE",
+            performed_by=str(user_id),
+            new_values={"route_key": body.route_key, "title": body.title},
+            request=request,
+        )
 
-
-async def get_my_permissions(current_user: CurrentUser):
-    # Find all active role IDs assigned to currently logged in employee
-    user_roles = await db.employee_roles.find_many(
-        where={
-            "employee_id": current_user.id,
-            "is_active": True
+        await invalidate_permissions()
+        return {
+            "route_key": body.route_key,
+            "title": body.title,
+            "updated_rows": count,
         }
-    )
-    role_ids = [r.role_id for r in user_roles]
 
-    if not role_ids:
-        return []
-
-    # Find all unique active route keys for those roles
-    permissions = await db.route_permissions.find_many(
-        where={
-            "role_id": {"in": role_ids},
-            "is_active": True
-        }
-    )
-
-    # Return a unique list of route_keys as expected by the frontend
-    return list(set(p.route_key for p in permissions))
+    async def get_my_permissions(self, current_user: CurrentUser) -> list[str]:
+        user_id = UUID(str(current_user.id))
+        return await self.repo.get_employee_route_keys(user_id)

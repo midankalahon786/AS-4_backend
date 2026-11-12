@@ -1,342 +1,232 @@
-# src/employees/service.py
+"""
+src/employees/service.py
+────────────────────────
+Employee Service layer decoupled via IEmployeeRepository.
+"""
+
+from __future__ import annotations
+
 import logging
-import math
-from typing import List, Optional
-from uuid import UUID
-from datetime import datetime, timezone
-from passlib.context import CryptContext
+import uuid
+from typing import Any
+
 from fastapi import HTTPException, Request, status
-from src.prisma.client import db
-from src.employees import schemas
-from src.notifications.service import NotificationService
-from src.notifications.schemas import NotificationType
-from src.common.audit import audit_ctx, audit
+from passlib.context import CryptContext
+
+from src.common.audit import audit_ctx
 from src.common.cache import cache_delete, invalidate_pattern
+from src.employees import schemas
+from src.employees.interfaces import IEmployeeRepository
+from src.notifications.schemas import NotificationType
+from src.common import internal_client
 
 logger = logging.getLogger(__name__)
 
-
-def _get_notif_service() -> NotificationService:
-    try:
-        from src.notifications.redis_client import get_redis
-        r = get_redis()
-    except RuntimeError:
-        r = None
-    return NotificationService(db, redis=r)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache invalidation
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _invalidate_employee_caches(employee_id: str) -> None:
-    await cache_delete(f"wallets:employee:{employee_id}")
-    await cache_delete(f"dashboard:platform:{employee_id}")
-    await cache_delete(f"dashboard:reviews:{employee_id}")
-    await cache_delete("roles:employees")
-    await cache_delete("dashboard:leaderboard")
-    await invalidate_pattern("dashboard:team:*")
-    await cache_delete("dashboard:teams")
-    logger.debug("cache invalidated for employee=%s", employee_id)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Password hashing
-# ─────────────────────────────────────────────────────────────────────────────
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# READ — list
-# ─────────────────────────────────────────────────────────────────────────────
+class EmployeeService:
+    def __init__(self, repo: IEmployeeRepository) -> None:
+        self.repo = repo
 
-async def list_employees(
-    page: int,
-    limit: int,
-    department_id: Optional[UUID] = None,
-    designation_id: Optional[UUID] = None,
-    status_id: Optional[UUID] = None,
-    manager_id: Optional[UUID] = None,
-    is_active: Optional[bool] = None,
-    search: Optional[str] = None,
-    sort_by: Optional[str] = "created_at",
-    sort_order: Optional[str] = "desc",
-) -> schemas.EmployeeListResponse:
+    @staticmethod
+    async def invalidate_employee_caches(employee_id: uuid.UUID) -> None:
+        eid_str = str(employee_id)
+        await cache_delete(f"wallets:employee:{eid_str}")
+        await cache_delete(f"dashboard:platform:{eid_str}")
+        await cache_delete(f"dashboard:reviews:{eid_str}")
+        await cache_delete("roles:employees")
+        await cache_delete("dashboard:leaderboard")
+        await invalidate_pattern("dashboard:team:*")
+        await cache_delete("dashboard:teams")
+        logger.debug("Cache invalidated for employee=%s", eid_str)
 
-    where_clause = {}
-    and_conditions = []
+    # ─────────────────────────────────────────────────────────────────────────
+    # Read Methods
+    # ─────────────────────────────────────────────────────────────────────────
 
-    if department_id:
-        and_conditions.append({"department_id": str(department_id)})
-    if designation_id:
-        and_conditions.append({"designation_id": str(designation_id)})
-    if status_id:
-        and_conditions.append({"status_id": str(status_id)})
-    if manager_id:
-        and_conditions.append({"manager_id": str(manager_id)})
+    async def list_employees(
+        self,
+        page: int,
+        limit: int,
+        department_id: uuid.UUID | None = None,
+        designation_id: uuid.UUID | None = None,
+        status_id: uuid.UUID | None = None,
+        manager_id: uuid.UUID | None = None,
+        is_active: bool | None = None,
+        search: str | None = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
+    ) -> schemas.EmployeeListResponse:
+        return await self.repo.list_employees(
+            page=page,
+            limit=limit,
+            department_id=department_id,
+            designation_id=designation_id,
+            status_id=status_id,
+            manager_id=manager_id,
+            is_active=is_active,
+            search=search,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
 
-    if is_active is not None:
-        if is_active:
-            and_conditions.append({"status_master_employees_status_idTostatus_master": {"is": {"status_code": "ACTIVE"}}})
-        else:
-            and_conditions.append({"status_master_employees_status_idTostatus_master": {"is_not": {"status_code": "ACTIVE"}}})
+    async def get_employee_detail(
+        self, employee_id: uuid.UUID
+    ) -> schemas.EmployeeDetailResponse:
+        emp = await self.repo.get_employee_by_id(employee_id)
+        if not emp:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found"
+            )
 
-    if search:
-        and_conditions.append({
-            "OR": [
-                {"username": {"contains": search, "mode": "insensitive"}},
-                {"email":    {"contains": search, "mode": "insensitive"}},
-            ]
-        })
+        # 1. Fetch active roles via internal_client (or roles repo/endpoint)
+        roles_list: list[schemas.RoleResponse] = []
+        try:
+            roles_data = await internal_client.get_employee_roles(str(employee_id))
+            for r in roles_data or []:
+                roles_list.append(
+                    schemas.RoleResponse(
+                        role_id=r["role_id"],
+                        role_name=r["role_name"],
+                        role_code=r["role_code"],
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch roles for employee %s: %s", employee_id, exc
+            )
 
-    if and_conditions:
-        where_clause["AND"] = and_conditions
+        # 2. Fetch department using emp.department_id
+        dept_resp = None
+        if emp.department_id:
+            try:
+                dept_data = await internal_client.get_department_by_id(
+                    str(emp.department_id)
+                )
+                if dept_data:
+                    dept_type_data = dept_data.get("department_type")
+                    dept_type_resp = (
+                        schemas.DepartmentTypeResponse(
+                            type_name=dept_type_data["type_name"],
+                            type_code=dept_type_data["type_code"],
+                        )
+                        if dept_type_data
+                        else None
+                    )
+                    dept_resp = schemas.DepartmentResponse(
+                        department_id=dept_data["department_id"],
+                        department_name=dept_data["department_name"],
+                        department_code=dept_data["department_code"],
+                        department_type=dept_type_resp,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch department %s: %s", emp.department_id, exc
+                )
 
-    total_count = await db.employees.count(where=where_clause)
-    total_pages = math.ceil(total_count / limit)
-    skip        = (page - 1) * limit
+        # 3. Fetch wallet using emp.employee_id
+        wallet_resp = None
+        try:
+            wallet_data = await internal_client.get_wallet_by_employee(str(employee_id))
+            if wallet_data:
+                wallet_resp = schemas.WalletResponse.model_validate(wallet_data)
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch wallet for employee %s: %s", employee_id, exc
+            )
 
-    allowed_sorts = ["created_at", "username", "date_of_joining"]
-    sort_field    = sort_by if sort_by in allowed_sorts else "created_at"
-    order         = sort_order if sort_order in ["asc", "desc"] else "desc"
+        is_active = (
+            emp.status.status_code in ("ACTIVE", "EMP_ACTIVE", "GEN_ACTIVE")
+        ) if emp.status else False
 
-    employees = await db.employees.find_many(
-        where=where_clause,
-        skip=skip,
-        take=limit,
-        order={sort_field: order},
-        include={
-            "departments_employees_department_idTodepartments":     True,
-            "designations_employees_designation_idTodesignations":  True,
-            "status_master_employees_status_idTostatus_master":     True,
-            "employees_employees_manager_idToemployees":            True,
-        },
-    )
-
-    data = []
-    for emp in employees:
-        dept  = emp.departments_employees_department_idTodepartments
-        desig = emp.designations_employees_designation_idTodesignations
-        stat  = emp.status_master_employees_status_idTostatus_master
-        mgr   = emp.employees_employees_manager_idToemployees
-        is_emp_active = stat.status_code == "ACTIVE" if stat else False
-
-        data.append(schemas.EmployeeListItem(
+        return schemas.EmployeeDetailResponse(
             employee_id=emp.employee_id,
             username=emp.username,
             email=emp.email,
-            designation_id=desig.designation_id if desig else None,
-            designation_name=desig.designation_name if desig else None,
-            department_id=dept.department_id if dept else None,
-            department_name=dept.department_name if dept else None,
-            manager_id=mgr.employee_id if mgr else None,
-            manager_name=mgr.username if mgr else None,
             date_of_joining=emp.date_of_joining,
-            status_id=stat.status_id if stat else None,
-            status_name=stat.status_name if stat else None,
-            is_active=is_emp_active,
+            date_of_birth=emp.date_of_birth,
+            is_active=is_active,
+            designation=(
+                schemas.DesignationResponse.model_validate(emp.designation)
+                if emp.designation
+                else None
+            ),
+            department=dept_resp,
+            manager=(
+                schemas.ManagerResponse.model_validate(emp.manager)
+                if emp.manager
+                else None
+            ),
+            status=(
+                schemas.StatusResponse.model_validate(emp.status)
+                if emp.status
+                else None
+            ),
+            wallet=wallet_resp,
+            roles=roles_list,
             created_at=emp.created_at,
+            created_by=emp.created_by,
             updated_at=emp.updated_at,
-        ))
-
-    return schemas.EmployeeListResponse(
-        data=data,
-        pagination=schemas.PaginationMeta(
-            current_page=page,
-            per_page=limit,
-            total=total_count,
-            total_pages=total_pages,
-            has_next=page < total_pages,
-            has_previous=page > 1,
-        ),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# READ — detail
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def get_employee_detail(employee_id: str):
-    emp = await db.employees.find_unique(
-        where={"employee_id": employee_id},
-        include={
-            "departments_employees_department_idTodepartments": {
-                "include": {"department_types": True}
-            },
-            "designations_employees_designation_idTodesignations":  True,
-            "status_master_employees_status_idTostatus_master":     True,
-            "employees_employees_manager_idToemployees":            True,
-            "wallets_wallets_employee_idToemployees":               True,
-            "employee_roles_employee_roles_employee_idToemployees": {
-                "where":   {"is_active": True},
-                "include": {"roles": True},
-            },
-        },
-    )
-
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    emp_roles  = emp.employee_roles_employee_roles_employee_idToemployees
-    roles_list = []
-    if emp_roles:
-        for er in emp_roles:
-            if er.roles:
-                roles_list.append(schemas.RoleResponse(
-                    role_id=er.roles.role_id,
-                    role_name=er.roles.role_name,
-                    role_code=er.roles.role_code,
-                ))
-
-    dept           = emp.departments_employees_department_idTodepartments
-    dept_type_resp = None
-    if dept and dept.department_types:
-        dept_type_resp = schemas.DepartmentTypeResponse(
-            type_name=dept.department_types.type_name,
-            type_code=dept.department_types.type_code,
+            updated_by=emp.updated_by,
         )
 
-    stat      = emp.status_master_employees_status_idTostatus_master
-    is_active = stat.status_code == "ACTIVE" if stat else False
-    mgr       = emp.employees_employees_manager_idToemployees
-    wallet    = emp.wallets_wallets_employee_idToemployees
+    # ─────────────────────────────────────────────────────────────────────────
+    # Write Methods
+    # ─────────────────────────────────────────────────────────────────────────
 
-    return schemas.EmployeeDetailResponse(
-        employee_id=emp.employee_id,
-        username=emp.username,
-        email=emp.email,
-        date_of_joining=emp.date_of_joining,
-        is_active=is_active,
-        designation=schemas.DesignationResponse(
-            designation_id=emp.designations_employees_designation_idTodesignations.designation_id,
-            designation_name=emp.designations_employees_designation_idTodesignations.designation_name,
-            designation_code=emp.designations_employees_designation_idTodesignations.designation_code,
-            level=emp.designations_employees_designation_idTodesignations.level,
-        ) if emp.designations_employees_designation_idTodesignations else None,
-        department=schemas.DepartmentResponse(
-            department_id=dept.department_id,
-            department_name=dept.department_name,
-            department_code=dept.department_code,
-            department_type=dept_type_resp,
-        ) if dept else None,
-        manager=schemas.ManagerResponse(
-            employee_id=mgr.employee_id,
-            username=mgr.username,
-            email=mgr.email,
-        ) if mgr else None,
-        status=schemas.StatusResponse(
-            status_id=stat.status_id,
-            status_code=stat.status_code,
-            status_name=stat.status_name,
-        ) if stat else None,
-        wallet=schemas.WalletResponse(
-            wallet_id=wallet.wallet_id,
-            available_points=wallet.available_points,
-            redeemed_points=wallet.redeemed_points,
-            total_earned_points=wallet.total_earned_points,
-            version=wallet.version,
-        ) if wallet else None,
-        roles=roles_list,
-        created_at=emp.created_at,
-        created_by=emp.created_by,
-        updated_at=emp.updated_at,
-        updated_by=emp.updated_by,
-    )
+    async def create_employee(
+        self,
+        data: schemas.CreateEmployeeRequest,
+        created_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.EmployeeCreatedResponse:
+        existing = await self.repo.get_by_username_or_email(data.username, data.email)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username or Email already exists",
+            )
 
+        default_role_id = await self.repo.get_role_by_code("EMPLOYEE")
+        if not default_role_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Default 'EMPLOYEE' role not found",
+            )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WRITE — create
-# ─────────────────────────────────────────────────────────────────────────────
+        hashed_pwd = get_password_hash(data.password)
+        new_emp = None
 
-async def create_employee(
-    data: schemas.CreateEmployeeRequest,
-    created_by_id: str,
-    request: Optional[Request] = None,
-):
-    existing = await db.employees.find_first(
-        where={"OR": [{"username": data.username}, {"email": data.email}]}
-    )
-    if existing:
-        raise HTTPException(status_code=400, detail="Username or Email already exists")
-
-    default_role = await db.roles.find_unique(where={"role_code": "EMPLOYEE"})
-    if not default_role:
-        raise HTTPException(status_code=500, detail="Default 'EMPLOYEE' role not found")
-
-    hashed_pwd = get_password_hash(data.password)
-    now        = datetime.now(timezone.utc)
-
-    # Variables declared outside so the audit lambda can close over them
-    new_emp = None
-    wallet  = None
-
-    try:
         async with audit_ctx(
-            user_id    = created_by_id,
-            request    = request,
-            table_name = "employees",
-            record_id  = lambda: str(new_emp.employee_id),
-            operation  = "INSERT",
-            new_values = lambda: {
-                "username":      new_emp.username,
-                "email":         new_emp.email,
+            user_id=str(created_by_id),
+            request=request,
+            table_name="employees",
+            record_id=lambda: str(new_emp.employee_id) if new_emp else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
+                "username": new_emp.username,
+                "email": new_emp.email,
                 "department_id": str(new_emp.department_id),
-                "designation_id":str(new_emp.designation_id),
-                "status_id":     str(new_emp.status_id),
+                "designation_id": str(new_emp.designation_id),
+                "status_id": str(new_emp.status_id),
             },
         ):
-            async with db.tx() as transaction:
-                new_emp = await transaction.employees.create(
-                    data={
-                        "username":        data.username,
-                        "email":           data.email,
-                        "password_hash":   hashed_pwd,
-                        "date_of_joining": datetime.combine(
-                            data.date_of_joining, datetime.min.time()
-                        ).replace(tzinfo=timezone.utc),
-                        "date_of_birth":   datetime.combine(
-                            data.date_of_birth, datetime.min.time()
-                        ).replace(tzinfo=timezone.utc) if data.date_of_birth else None,
-                        "updated_at":      now,
-                        "designation_id":  str(data.designation_id),
-                        "department_id":   str(data.department_id),
-                        "status_id":       str(data.status_id),
-                        "manager_id":      str(data.manager_id),
-                        "created_by":      created_by_id,
-                        "updated_by":      created_by_id,
-                    },
-                    include={"status_master_employees_status_idTostatus_master": True},
-                )
-
-                wallet = await transaction.wallets.create(
-                    data={
-                        "available_points": 0,
-                        "updated_at":       now,
-                        "employee_id":      new_emp.employee_id,
-                        "created_by":       created_by_id,
-                        "updated_by":       created_by_id,
-                    }
-                )
-
-                await transaction.employee_roles.create(
-                    data={
-                        "assigned_at": now,
-                        "updated_at":  now,
-                        "employee_id": new_emp.employee_id,
-                        "role_id":     default_role.role_id,
-                        "created_by":  created_by_id,
-                        "updated_by":  created_by_id,
-                        "assigned_by": created_by_id,
-                    }
-                )
+            new_emp = await self.repo.create_employee_with_wallet_and_role(
+                data=data,
+                hashed_password=hashed_pwd,
+                default_role_id=default_role_id,
+                created_by_id=created_by_id,
+            )
 
         is_active = (
-            new_emp.status_master_employees_status_idTostatus_master.status_code == "ACTIVE"
-            if new_emp.status_master_employees_status_idTostatus_master else False
+            (new_emp.status.status_code in ("ACTIVE", "EMP_ACTIVE", "GEN_ACTIVE"))
+            if new_emp.status
+            else False
         )
 
         response = schemas.EmployeeCreatedResponse(
@@ -347,156 +237,202 @@ async def create_employee(
             department_id=new_emp.department_id,
             manager_id=new_emp.manager_id,
             date_of_joining=new_emp.date_of_joining,
+            date_of_birth=new_emp.date_of_birth,
             status_id=new_emp.status_id,
             is_active=is_active,
             created_at=new_emp.created_at,
             created_by=new_emp.created_by,
-            wallet=schemas.WalletResponse(
-                wallet_id=wallet.wallet_id,
-                available_points=wallet.available_points,
-                redeemed_points=wallet.redeemed_points,
-                total_earned_points=wallet.total_earned_points,
-                version=wallet.version,
+            wallet=(
+                schemas.WalletResponse.model_validate(new_emp.wallet)
+                if new_emp.wallet
+                else None
             ),
         )
 
-        await _invalidate_employee_caches(new_emp.employee_id)
+        await self.invalidate_employee_caches(new_emp.employee_id)
 
         try:
             from src.common.event_publisher import publish
-            await publish("events:employee.created", {
-                "employee_id": str(new_emp.employee_id),
-                "created_by":  created_by_id,
-            })
-        except Exception:
-            logger.exception(
-                "event publish failed for employee %s — account created successfully",
-                new_emp.employee_id,
-            )
 
-        try:
-            await _get_notif_service().create_notification(
-                employee_id=new_emp.employee_id,
-                title="Welcome to the platform! 🎉",
-                message=(
-                    f"Hi {new_emp.username}, your account is ready. "
-                    "You can now give and receive recognition from your peers."
-                ),
-                type=NotificationType.SYSTEM,
+            await publish(
+                "events:employee.created",
+                {
+                    "employee_id": str(new_emp.employee_id),
+                    "created_by": str(created_by_id),
+                },
             )
         except Exception:
             logger.exception(
-                "Welcome notification failed for employee %s — account created successfully",
-                new_emp.employee_id,
+                "Event publish failed for employee %s", new_emp.employee_id
             )
 
         return response
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Error creating employee")
-        raise HTTPException(status_code=400, detail=f"Creation failed: {str(e)}")
+    async def update_employee(
+        self,
+        employee_id: uuid.UUID,
+        data: schemas.UpdateEmployeeRequest,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.EmployeeDetailResponse:
+        existing = await self.repo.get_employee_by_id(employee_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found"
+            )
 
+        update_data = {k: v for k, v in data.model_dump(exclude_unset=True).items()}
+        if not update_data:
+            return await self.get_employee_detail(employee_id)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WRITE — full update (PUT)
-# ─────────────────────────────────────────────────────────────────────────────
+        # Handle is_active translation to status_id
+        if "is_active" in update_data:
+            is_active_flag = update_data.pop("is_active")
+            if is_active_flag is not None:
+                if is_active_flag:
+                    target_status_id = (
+                        await self.repo.get_status_by_code("EMP_ACTIVE")
+                        or await self.repo.get_status_by_code("ACTIVE")
+                    )
+                else:
+                    target_status_id = (
+                        await self.repo.get_status_by_code("EMP_INACTIVE")
+                        or await self.repo.get_status_by_code("INACTIVE")
+                    )
+                if not target_status_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"{'ACTIVE' if is_active_flag else 'INACTIVE'} status not found",
+                    )
+                update_data["status_id"] = target_status_id
 
-async def update_employee(
-    employee_id: str,
-    data: schemas.UpdateEmployeeRequest,
-    updated_by_id: str,
-    request: Optional[Request] = None,
-):
-    update_data = {k: v for k, v in data.model_dump(exclude_unset=True).items()}
-    if not update_data:
-        return await get_employee_detail(employee_id)
+        if not update_data:
+            return await self.get_employee_detail(employee_id)
 
-    # Snapshot old values before the write
-    existing = await db.employees.find_unique(where={"employee_id": employee_id})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Employee not found")
+        old_snapshot = {
+            "username": existing.username,
+            "email": existing.email,
+            "department_id": str(existing.department_id),
+            "designation_id": str(existing.designation_id),
+            "status_id": str(existing.status_id),
+            "manager_id": str(existing.manager_id) if existing.manager_id else None,
+        }
 
-    old_snapshot = {
-        "username":       existing.username,
-        "email":          existing.email,
-        "department_id":  str(existing.department_id),
-        "designation_id": str(existing.designation_id),
-        "status_id":      str(existing.status_id),
-        "manager_id":     str(existing.manager_id) if existing.manager_id else None,
-    }
-
-    for key in ["designation_id", "department_id", "manager_id", "status_id"]:
-        if key in update_data and update_data[key]:
-            update_data[key] = str(update_data[key])
-
-    if "date_of_birth" in update_data:
-        dob = update_data["date_of_birth"]
-        update_data["date_of_birth"] = (
-            datetime.combine(dob, datetime.min.time()).replace(tzinfo=timezone.utc)
-            if dob else None
-        )
-
-    update_data["updated_by"] = updated_by_id
-    update_data["updated_at"] = datetime.now(timezone.utc)
-
-    updated = None
-    async with audit_ctx(
-        user_id    = updated_by_id,
-        request    = request,
-        table_name = "employees",
-        record_id  = employee_id,
-        operation  = "UPDATE",
-        old_values = old_snapshot,
-        new_values = lambda: {k: v for k, v in update_data.items()
-                              if k not in ("updated_by", "updated_at", "password_hash")},
-    ):
-        updated = await db.employees.update(
-            where={"employee_id": employee_id},
-            data=update_data,
-        )
-
-    await _invalidate_employee_caches(employee_id)
-    return await get_employee_detail(employee_id)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WRITE — deactivate (PATCH)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def patch_employee(
-    employee_id: str,
-    updated_by_id: str,
-    request: Optional[Request] = None,
-):
-    inactive_status = await db.status_master.find_first(
-        where={"status_code": "INACTIVE"}
-    )
-    if not inactive_status:
-        raise HTTPException(status_code=500, detail="INACTIVE status not found")
-
-    existing = await db.employees.find_unique(where={"employee_id": employee_id})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    async with audit_ctx(
-        user_id    = updated_by_id,
-        request    = request,
-        table_name = "employees",
-        record_id  = employee_id,
-        operation  = "DEACTIVATE",
-        old_values = {"status_id": str(existing.status_id)},
-        new_values = {"status_id": str(inactive_status.status_id), "status_code": "INACTIVE"},
-    ):
-        await db.employees.update(
-            where={"employee_id": employee_id},
-            data={
-                "status_id":  inactive_status.status_id,
-                "updated_by": updated_by_id,
-                "updated_at": datetime.now(timezone.utc),
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="employees",
+            record_id=str(employee_id),
+            operation="UPDATE",
+            old_values=old_snapshot,
+            new_values=lambda: {
+                k: str(v) if isinstance(v, uuid.UUID) else v
+                for k, v in update_data.items()
             },
-        )
+        ):
+            await self.repo.update_employee(
+                employee_id=employee_id,
+                update_fields=update_data,
+                updated_by_id=updated_by_id,
+            )
 
-    await _invalidate_employee_caches(employee_id)
-    return True
+        await self.invalidate_employee_caches(employee_id)
+        return await self.get_employee_detail(employee_id)
+
+    async def activate_employee(
+        self,
+        employee_id: uuid.UUID,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> bool:
+        active_status_id = (
+            await self.repo.get_status_by_code("EMP_ACTIVE")
+            or await self.repo.get_status_by_code("ACTIVE")
+        )
+        if not active_status_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ACTIVE status not found",
+            )
+
+        existing = await self.repo.get_employee_by_id(employee_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found"
+            )
+
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="employees",
+            record_id=str(employee_id),
+            operation="ACTIVATE",
+            old_values={"status_id": str(existing.status_id)},
+            new_values={
+                "status_id": str(active_status_id),
+                "status_code": "ACTIVE",
+            },
+        ):
+            await self.repo.update_status(
+                employee_id=employee_id,
+                status_id=active_status_id,
+                updated_by_id=updated_by_id,
+            )
+
+        await self.invalidate_employee_caches(employee_id)
+        return True
+
+    async def deactivate_employee(
+        self,
+        employee_id: uuid.UUID,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> bool:
+        inactive_status_id = (
+            await self.repo.get_status_by_code("EMP_INACTIVE")
+            or await self.repo.get_status_by_code("INACTIVE")
+        )
+        if not inactive_status_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="INACTIVE status not found",
+            )
+
+        existing = await self.repo.get_employee_by_id(employee_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found"
+            )
+
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="employees",
+            record_id=str(employee_id),
+            operation="DEACTIVATE",
+            old_values={"status_id": str(existing.status_id)},
+            new_values={
+                "status_id": str(inactive_status_id),
+                "status_code": "INACTIVE",
+            },
+        ):
+            await self.repo.update_status(
+                employee_id=employee_id,
+                status_id=inactive_status_id,
+                updated_by_id=updated_by_id,
+            )
+
+        await self.invalidate_employee_caches(employee_id)
+        return True
+
+    async def get_active_counts(self) -> dict[str, int]:
+        return await self.repo.get_active_counts()
+
+    async def get_manager_email(self, employee_id: uuid.UUID) -> str:
+        email = await self.repo.get_manager_email(employee_id)
+        if not email:
+            raise HTTPException(status_code=404, detail="Manager or employee not found")
+        return email
+
+    async def get_departments_with_members(self) -> list[dict[str, Any]]:
+        return await self.repo.get_departments_with_members()

@@ -1,44 +1,44 @@
-import uvicorn
+"""
+src/organization/main.py
+────────────────────────
+Organization Service entry point.
+Handles company structure: Departments, Designations, Department Types, Statuses, and Audits.
+Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
+"""
+from __future__ import annotations
+
 import os
-from fastapi import FastAPI, HTTPException
-# CORSMiddleware import removed
-from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
 
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from prisma.errors import UniqueViolationError
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from src.common.middleware import (
-    request_rate_limit_middleware,
-    http_exception_handler,
-    validation_exception_handler,
-    generic_exception_handler,
-    prisma_unique_violation_handler
-)
 from src.common.cors_setup import initialize_cors_and_middleware
-
-# --- OpenTelemetry Imports ---
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-# -----------------------------
-
-from src.prisma.client import db, connect_with_retry
-from src.notifications.redis_client import connect_redis, disconnect_redis
 from src.common.dependencies import close_auth_client
-from src.organization.router import (
-    departments_router,
-    designations_router,
-    department_types_router,
-    statuses_router,
-    audit_logs_router,
+from src.common.middleware import (
+    generic_exception_handler,
+    http_exception_handler,
+    request_rate_limit_middleware,
+    validation_exception_handler,
 )
 from src.common.route_registry import register_app_routes
+from src.common.telemetry import setup_telemetry
+from src.core.database import engine
+from src.notifications.redis_client import connect_redis, disconnect_redis
+from src.organization.router import (
+    audit_logs_router,
+    department_types_router,
+    departments_router,
+    designations_router,
+    statuses_router,
+)
 
-# ── Role overrides ────────────────────────────────────────────────────────────
+# ── Role Overrides ────────────────────────────────────────────────────────────[cite: 18]
 ROLE_OVERRIDES: dict[str, list[str]] = {
     # Departments
     "GET:/aabhar/v1/organizations/departments":                            ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
@@ -62,7 +62,7 @@ ROLE_OVERRIDES: dict[str, list[str]] = {
     "GET:/aabhar/v1/organizations/audit-logs/{audit_id}":                  ["SUPER_ADMIN", "HR_ADMIN"],
 }
 
-# ── Route titles ──────────────────────────────────────────────────────────────
+# ── Route Titles ──────────────────────────────────────────────────────────────[cite: 18]
 ROUTE_TITLES: dict[str, str] = {
     # Departments
     "GET:/aabhar/v1/organizations/departments":                            "List Departments",
@@ -88,28 +88,31 @@ ROUTE_TITLES: dict[str, str] = {
 
 _PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
 
-# ── OpenTelemetry ─────────────────────────────────────────────────────────────
-resource      = Resource.create({"service.name": "rnr-organization"})
-provider      = TracerProvider(resource=resource)
-otlp_exporter = OTLPSpanExporter()
-processor     = BatchSpanProcessor(otlp_exporter)
-provider.add_span_processor(processor)
-trace.set_tracer_provider(provider)
+
+async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+    """Handles unique constraints (e.g., department or designation code collisions) cleanly."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "A database constraint was violated. A conflicting code or name already exists."},
+    )
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
+# ── Lifespan ──────────────────────────────────────────────────────────────────[cite: 18]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Organization Service: Connecting to Database...")
-    await connect_with_retry()
-    print("Organization Service: 🟢 Database Connected")
+    # 1. Connect and verify PostgreSQL via SQLAlchemy
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    print("Organization Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
+    # 2. Redis Cache setup
     try:
         await connect_redis()
-        print("Organization Service: ☑️ Redis Connected")
+        print("Organization Service: ☑️  Redis Connected")
     except Exception as e:
         print(f"Organization Service: ⚠️  Redis unavailable ({e}) — caching disabled")
 
+    # 3. Dynamic route registration
     await register_app_routes(
         app,
         default_roles=["SUPER_ADMIN", "HR_ADMIN"],
@@ -119,17 +122,18 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean up connections on shutdown
     print("Organization Service: Disconnecting...")
     await close_auth_client()
     await disconnect_redis()
-    await db.disconnect()
-    print("Organization Service: 🔴 Database Disconnected")
+    await engine.dispose()
+    print("Organization Service: 🔴 Database Disconnected & Pool Disposed")
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────[cite: 18]
 app = FastAPI(
     title="Organization Service",
-    description="Microservice for handling company structure: Departments and Designations",
+    description="Microservice for handling company structure: Departments, Designations, and Statuses",
     version="1.0.0",
     root_path="/aabhar/v1/organizations",
     openapi_url="/openapi.json",
@@ -141,7 +145,7 @@ initialize_cors_and_middleware(app)
 
 app.middleware("http")(request_rate_limit_middleware)
 
-app.add_exception_handler(UniqueViolationError, prisma_unique_violation_handler)
+app.add_exception_handler(IntegrityError, sqlalchemy_integrity_error_handler)
 app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
@@ -152,14 +156,15 @@ async def health_check():
     return {"status": "healthy", "service": "Organization Service"}
 
 
-app.include_router(departments_router,          prefix="/departments",          tags=["Departments"])
-app.include_router(designations_router,         prefix="/designations",         tags=["Designations"])
-app.include_router(department_types_router,     prefix="/department-types",     tags=["Department Types"])
-app.include_router(statuses_router,             prefix="/statuses",             tags=["Status Master"])
-app.include_router(audit_logs_router,           prefix="/audit-logs",           tags=["Audit Logs"])
+# Routers
+app.include_router(departments_router, prefix="/departments", tags=["Departments"])
+app.include_router(designations_router, prefix="/designations", tags=["Designations"])
+app.include_router(department_types_router, prefix="/department-types", tags=["Department Types"])
+app.include_router(statuses_router, prefix="/statuses", tags=["Status Master"])
+app.include_router(audit_logs_router, prefix="/audit-logs", tags=["Audit Logs"])
 
 
-# ── OpenAPI schema ────────────────────────────────────────────────────────────
+# ── OpenAPI Schema ────────────────────────────────────────────────────────────[cite: 18]
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -185,10 +190,7 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-FastAPIInstrumentor.instrument_app(
-    app,
-    excluded_urls="health,/docs,/openapi.json",
-)
+setup_telemetry(app, "rnr-organization", excluded_urls="health,/docs,/openapi.json")
 
 if __name__ == "__main__":
     uvicorn.run("src.organization.main:app", host="0.0.0.0", port=8007, reload=True)

@@ -1,51 +1,32 @@
-# src/notifications/service.py
 """
-NotificationService — unchanged public API.
-One addition: after every DB insert, push the notification_id into
-the Redis queue so the worker wakes up immediately instead of polling.
-Redis is optional — if unavailable, the notification still lands in
-the DB and the recovery scan on next startup will pick it up.
+src/notifications/service.py
+────────────────────────────
+Notification service decoupled via INotificationRepository.
+Pushes notification IDs to the Redis queue for worker pickup[cite: 44].
+"""
+from __future__ import annotations
 
-BUG FIXES vs original:
-  1. Prisma filter `startswith` → `startsWith` (Prisma uses camelCase).
-     The original lowercase spelling caused a runtime KeyError / 500 on every
-     call to get_notifications(), get_unread_count(), and
-     celebration_already_sent_today().
-  2. mark_all_as_read() now returns `result.count` (int) instead of the raw
-     Prisma BatchResult object. The router and callers expect a plain int.
-     Root cause of the traceback:
-       AttributeError: 'int' object has no attribute 'count'
-     The error text is misleading — Python underlines the `def` line, not the
-     call site. What actually happened: the OLD service returned `result`
-     (a BatchResult), the router called `.count` on it; after the first fix
-     attempt the service returned `result.count` (an int), but the router
-     was accidentally updated to call `.count` on THAT int. The fix is:
-       service  → return result.count      (BatchResult → int)
-       router   → return {"marked_read": updated}  (int, no .count)
-  3. get_notifications() and get_unread_count() now exclude legacy DB rows
-     (REWARD_REDEEMED, POINTS_CREDIT) at query time so they never reach
-     the Pydantic serialiser and cannot cause a ValidationError → 500.
-  4. Sentinel rows ([SENTINEL] prefix) are excluded from get_notifications()
-     and get_unread_count() so they never appear in the employee UI.
-"""
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from typing import Any
 from uuid import UUID
 
-from prisma import Prisma
-
-from .schemas import NotificationType
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.notifications import schemas
+from src.notifications.interfaces import INotificationRepository
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationService:
-    def __init__(self, db: Prisma, redis=None) -> None:
-        self._db = db
-        self._redis = redis   # aioredis.Redis | None
+    def __init__(self, repo: INotificationRepository | AsyncSession, redis=None) -> None:
+        if isinstance(repo, AsyncSession):
+            from src.notifications.repository import SQLAlchemyNotificationRepository
+            self.repo = SQLAlchemyNotificationRepository(repo)
+        else:
+            self.repo = repo
+        self._redis = redis
 
-    # ── Core create ───────────────────────────────────────────────────────────
+    # ── Core Creation ─────────────────────────────────────────────────────────
 
     async def create_notification(
         self,
@@ -53,34 +34,39 @@ class NotificationService:
         employee_id: UUID | str,
         title: str,
         message: str,
-        type: NotificationType,
-    ) -> dict:
-        record = await self._db.notifications.create(
-            data={
-                "employee_id": str(employee_id),
-                "title":       title,
-                "message":     message,
-                "type":        type.value,
-                "is_read":     False,
-                "email_sent":  False,
-                "created_at":  datetime.now(tz=timezone.utc),
-            }
+        type: schemas.NotificationType,
+    ) -> dict[str, Any]:
+        emp_id = UUID(str(employee_id))
+        record = await self.repo.create_notification(
+            employee_id=emp_id,
+            title=title,
+            message=message,
+            notification_type=type.value,
         )
         logger.debug(
             "Notification created: id=%s employee=%s type=%s",
             record.notification_id,
-            employee_id,
+            emp_id,
             type,
         )
 
-        # Signal the worker via Redis (non-blocking; DB is the source of truth)
         if self._redis is not None:
-            from .cache import enqueue_notification
+            from src.notifications.cache import enqueue_notification
             await enqueue_notification(self._redis, str(record.notification_id))
 
-        return record.model_dump()
+        return {
+            "notification_id": record.notification_id,
+            "employee_id": record.employee_id,
+            "title": record.title,
+            "message": record.message,
+            "type": record.type,
+            "is_read": record.is_read,
+            "email_sent": record.email_sent,
+            "created_at": record.created_at,
+            "read_at": record.read_at,
+        }
 
-    # ── Bulk helpers ──────────────────────────────────────────────────────────
+    # ── Bulk Helpers ──────────────────────────────────────────────────────────
 
     async def create_bulk_notifications(
         self,
@@ -88,61 +74,54 @@ class NotificationService:
         employee_ids: list[UUID | str],
         title: str,
         message: str,
-        type: NotificationType,
-    ) -> list[dict]:
-        records: list[dict] = []
-        for eid in employee_ids:
-            record = await self.create_notification(
-                employee_id=eid,
-                title=title,
-                message=message,
-                type=type,
-            )
-            records.append(record)
+        type: schemas.NotificationType,
+    ) -> list[dict[str, Any]]:
+        parsed_ids = [UUID(str(eid)) for eid in employee_ids]
+        records = await self.repo.create_bulk_notifications(
+            employee_ids=parsed_ids,
+            title=title,
+            message=message,
+            notification_type=type.value,
+        )
+
+        if self._redis is not None:
+            from src.notifications.cache import enqueue_notification
+            for rec in records:
+                await enqueue_notification(self._redis, str(rec.notification_id))
+
         logger.info(
             "Bulk notifications created: count=%d type=%s title=%r",
             len(records),
             type,
             title,
         )
-        return records
+        return [
+            {
+                "notification_id": r.notification_id,
+                "employee_id": r.employee_id,
+                "title": r.title,
+                "message": r.message,
+                "type": r.type,
+                "is_read": r.is_read,
+                "email_sent": r.email_sent,
+                "created_at": r.created_at,
+                "read_at": r.read_at,
+            }
+            for r in records
+        ]
 
     async def get_all_active_employee_ids(self) -> list[str]:
-        employees = await self._db.employees.find_many(
-            include={"status_master_employees_status_idTostatus_master": True}
-        )
-        return [
-            str(e.employee_id)
-            for e in employees
-            if (
-                e.status_master_employees_status_idTostatus_master is not None
-                and e.status_master_employees_status_idTostatus_master.status_code == "ACTIVE"
-            )
-        ]
+        ids = await self.repo.get_all_active_employee_ids()
+        return [str(eid) for eid in ids]
 
     async def get_active_employee_ids_by_department(
         self, department_ids: list[UUID | str]
     ) -> list[str]:
-        dept_id_strs = [str(d) for d in department_ids]
-        employees = await self._db.employees.find_many(
-            where={"department_id": {"in": dept_id_strs}},
-            include={"status_master_employees_status_idTostatus_master": True},
-        )
-        return [
-            str(e.employee_id)
-            for e in employees
-            if (
-                e.status_master_employees_status_idTostatus_master is not None
-                and e.status_master_employees_status_idTostatus_master.status_code == "ACTIVE"
-            )
-        ]
+        parsed = [UUID(str(d)) for d in department_ids]
+        ids = await self.repo.get_active_employee_ids_by_departments(parsed)
+        return [str(eid) for eid in ids]
 
-    # ── Read / mark-read ──────────────────────────────────────────────────────
-
-    # Legacy notification types that existed before the enum was trimmed.
-    # These rows are still in the DB and must be excluded at query time to
-    # prevent Pydantic ValidationError → 500 when serialising the list.
-    _LEGACY_TYPES = ["REWARD_REDEEMED", "POINTS_CREDIT", "BONUS", "CREDIT", "REDEMPTION"]
+    # ── Reads & State Updates ─────────────────────────────────────────────────
 
     async def get_notifications(
         self,
@@ -150,116 +129,38 @@ class NotificationService:
         employee_id: UUID | str,
         limit: int = 50,
         unread_only: bool = False,
-    ) -> list[dict]:
-        # FIX 1: Prisma string filter keys are camelCase — `startsWith` not `startswith`.
-        # FIX 2: Exclude legacy types (REWARD_REDEEMED, POINTS_CREDIT) at the DB level.
-        #        They no longer exist in NotificationType and Pydantic rejects them → 500.
-        # FIX 3: Exclude sentinel rows ([SENTINEL] prefix) — internal worker dedup markers
-        #        that must never appear in the employee-facing notification list.
-        where: dict = {
-            "employee_id": str(employee_id),
-            "title":       {"not": {"startsWith": "[SENTINEL]"}},
-            "type":        {"not": {"in": self._LEGACY_TYPES}},
-        }
-        if unread_only:
-            where["is_read"] = False
-
-        records = await self._db.notifications.find_many(
-            where=where,
-            order={"created_at": "desc"},
-            take=limit,
+    ) -> list[schemas.NotificationResponse]:
+        emp_id = UUID(str(employee_id))
+        records = await self.repo.get_notifications(
+            employee_id=emp_id,
+            limit=limit,
+            unread_only=unread_only,
         )
-        return [r.model_dump() for r in records]
+        return [schemas.NotificationResponse.model_validate(r) for r in records]
 
     async def get_unread_count(self, *, employee_id: UUID | str) -> int:
-        # FIX: camelCase + exclude legacy types so the badge count matches the list
-        return await self._db.notifications.count(
-            where={
-                "employee_id": str(employee_id),
-                "is_read":     False,
-                "title":       {"not": {"startsWith": "[SENTINEL]"}},
-                "type":        {"not": {"in": self._LEGACY_TYPES}},
-            }
-        )
+        emp_id = UUID(str(employee_id))
+        return await self.repo.get_unread_count(emp_id)
 
     async def mark_as_read(
         self,
         *,
         notification_id: UUID | str,
         employee_id: UUID | str,
-    ) -> Optional[dict]:
-        existing = await self._db.notifications.find_first(
-            where={
-                "notification_id": str(notification_id),
-                "employee_id":     str(employee_id),
-            }
-        )
-        if existing is None:
-            return None
-
-        updated = await self._db.notifications.update(
-            where={"notification_id": str(notification_id)},
-            data={
-                "is_read": True,
-                "read_at": datetime.now(tz=timezone.utc),
-            },
-        )
-        return updated.model_dump() if updated else None
+    ) -> schemas.NotificationResponse | None:
+        notif_id = UUID(str(notification_id))
+        emp_id = UUID(str(employee_id))
+        record = await self.repo.mark_as_read(notif_id, emp_id)
+        return schemas.NotificationResponse.model_validate(record) if record else None
 
     async def mark_all_as_read(self, *, employee_id: UUID | str) -> int:
-        result = await self._db.notifications.update_many(
-            where={"employee_id": str(employee_id), "is_read": False},
-            data={"is_read": True},
-        )
-        return result  
+        emp_id = UUID(str(employee_id))
+        return await self.repo.mark_all_as_read(emp_id)
 
-    # ── Celebration helpers ───────────────────────────────────────────────────
+    # ── Celebration Helpers ───────────────────────────────────────────────────
 
-    async def get_employees_with_celebrations_today(self) -> list[dict]:
-        from datetime import date
-
-        today       = date.today()
-        month, day  = today.month, today.day
-
-        all_employees = await self._db.employees.find_many(
-            include={"status_master_employees_status_idTostatus_master": True}
-        )
-
-        celebrants: list[dict] = []
-
-        for emp in all_employees:
-            status = emp.status_master_employees_status_idTostatus_master
-            if status is None or status.status_code != "ACTIVE":
-                continue
-
-            dob = emp.date_of_birth
-            if dob is not None and dob.month == month and dob.day == day:
-                celebrants.append({
-                    "employee_id":       emp.employee_id,
-                    "username":          emp.username,
-                    "email":             emp.email,
-                    "celebration_type":  "BIRTHDAY",
-                    "years":             None,
-                })
-
-            doj = emp.date_of_joining
-            if (
-                doj is not None
-                and doj.month == month
-                and doj.day  == day
-                and doj.year != today.year
-            ):
-                years = today.year - doj.year
-                celebrants.append({
-                    "employee_id":       emp.employee_id,
-                    "username":          emp.username,
-                    "email":             emp.email,
-                    "celebration_type":  "WORK_ANNIVERSARY",
-                    "years":             years,
-                })
-
-        logger.debug("Celebrations today: %d employee(s)", len(celebrants))
-        return celebrants
+    async def get_employees_with_celebrations_today(self) -> list[dict[str, Any]]:
+        return await self.repo.get_employees_with_celebrations_today()
 
     async def celebration_already_sent_today(
         self,
@@ -267,22 +168,8 @@ class NotificationService:
         employee_id: UUID | str,
         celebration_type: str,
     ) -> bool:
-        from datetime import date
-
-        start_of_day = datetime.combine(date.today(), datetime.min.time()).replace(
-            tzinfo=timezone.utc
-        )
-        # FIX: `startsWith` (camelCase) — `startswith` caused Prisma validation error → 500
-        existing = await self._db.notifications.find_first(
-            where={
-                "employee_id": str(employee_id),
-                "type":        "CELEBRATION",
-                "title":       {"startsWith": "[SENTINEL]"},
-                "message":     {"contains": f"[{celebration_type}]"},
-                "created_at":  {"gte": start_of_day},
-            }
-        )
-        return existing is not None
+        emp_id = UUID(str(employee_id))
+        return await self.repo.celebration_already_sent_today(emp_id, celebration_type)
 
     async def create_sentinel(
         self,
@@ -290,16 +177,20 @@ class NotificationService:
         employee_id: UUID | str,
         celebration_type: str,
         celebrant_name: str,
-    ) -> dict:
-        record = await self._db.notifications.create(
-            data={
-                "employee_id": str(employee_id),
-                "title":       f"[SENTINEL] {celebrant_name}",
-                "message":     f"[{celebration_type}] broadcast initiated",
-                "type":        NotificationType.CELEBRATION.value,
-                "is_read":     True,
-                "email_sent":  True,
-                "created_at":  datetime.now(tz=timezone.utc),
-            }
+    ) -> dict[str, Any]:
+        emp_id = UUID(str(employee_id))
+        record = await self.repo.create_sentinel(
+            employee_id=emp_id,
+            celebration_type=celebration_type,
+            celebrant_name=celebrant_name,
         )
-        return record.model_dump()
+        return {
+            "notification_id": record.notification_id,
+            "employee_id": record.employee_id,
+            "title": record.title,
+            "message": record.message,
+            "type": record.type,
+            "is_read": record.is_read,
+            "email_sent": record.email_sent,
+            "created_at": record.created_at,
+        }

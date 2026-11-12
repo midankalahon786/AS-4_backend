@@ -1,49 +1,81 @@
 import logging
 import os
 import redis.asyncio as aioredis
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-
 redis: aioredis.Redis | None = None
+
+
+def get_redis_url() -> str:
+    return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+
+def is_redis_disabled() -> bool:
+    if os.getenv("REDIS_DISABLED", "").strip().lower() in ("true", "1", "yes"):
+        return True
+    if os.getenv("REDIS_ENABLED", "").strip().lower() in ("false", "0", "no"):
+        return True
+    return False
+
+
+def is_redis_connected() -> bool:
+    return redis is not None
 
 
 async def connect_redis() -> aioredis.Redis:
     global redis
 
-    redis = aioredis.from_url(
-        REDIS_URL,
-        encoding="utf-8",
-        decode_responses=True,
-        socket_connect_timeout=5,
-        # Remove socket_timeout — it causes blocking xreadgroup calls to raise
-        # TimeoutError on Windows when no messages arrive within the timeout window,
-        # even with block=0. Let Redis operations run to natural completion.
-        socket_keepalive=True,
-        retry_on_timeout=True,
-        retry_on_error=[ConnectionError],
-        health_check_interval=15,
-        max_connections=20
-    )
+    if is_redis_disabled():
+        redis = None
+        logger.info("Redis is disabled via environment variable")
+        raise RuntimeError("Redis is disabled via environment variable")
 
-    await redis.ping()
+    url = get_redis_url()
+    try:
+        r = aioredis.from_url(
+            url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_connect_timeout=10,
+            socket_timeout=None,  # Crucial: Disables client-side read timeout on blocking stream reads
+            health_check_interval=15,  # Pings Redis periodically to prevent idle TCP drops
+            retry_on_timeout=True,
+            retry_on_error=[ConnectionError, TimeoutError],
+            max_connections=50,
+        )
 
-    host = REDIS_URL.split("@")[-1]
-    logger.info("Redis connected → %s", host)
+        await r.ping()
+        redis = r
 
-    return redis
+        host = url.split("@")[-1] if "@" in url else url
+        logger.info("Redis connected → %s", host)
+        return redis
+    except Exception as exc:
+        host = url.split("@")[-1] if "@" in url else url
+        logger.warning("Redis connection failed (%s): %s", host, exc)
+        redis = None
+        raise
 
 
 async def disconnect_redis():
     global redis
     if redis:
-        await redis.aclose()
-        redis = None
-        logger.info("Redis disconnected")
+        try:
+            await redis.aclose()
+        except Exception:
+            pass
+        finally:
+            redis = None
+            logger.info("Redis disconnected")
 
 
 def get_redis() -> aioredis.Redis:
     if redis is None:
-        raise RuntimeError("Redis not initialised — call connect_redis() in lifespan first.")
+        raise RuntimeError(
+            "Redis not initialised — call connect_redis() in lifespan first."
+        )
     return redis

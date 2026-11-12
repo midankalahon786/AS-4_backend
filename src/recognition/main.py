@@ -1,47 +1,36 @@
 """
 src/recognition/main.py  — Recognition Service entry point.
+Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
 """
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-# CORSMiddleware import removed
-from prisma.errors import UniqueViolationError
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
+from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.dependencies import close_auth_client
 from src.common.middleware import (
-    generic_exception_handler, http_exception_handler,
-    prisma_unique_violation_handler, request_rate_limit_middleware,
+    generic_exception_handler,
+    http_exception_handler,
+    request_rate_limit_middleware,
     validation_exception_handler,
 )
-from src.common.cors_setup import initialize_cors_and_middleware
 from src.common.route_registry import register_app_routes
+from src.common.telemetry import setup_telemetry
+from src.core.database import async_session_factory, engine
 from src.digest.router import router as digest_router
+from src.digest.worker import digest_worker_loop
 from src.notifications.email_sender import EmailSender, SMTPConfig
 from src.notifications.redis_client import connect_redis, disconnect_redis
-from src.prisma.client import connect_with_retry, db
 from src.recognition.internal_router import router as internal_router
 from src.recognition.router import categories_router as review_categories_router
 from src.recognition.router import router as recognition_router
-from src.digest.worker import digest_worker_loop
-
-# --- OpenTelemetry Configuration ---
-resource      = Resource.create({"service.name": "rnr-recognition"})
-provider      = TracerProvider(resource=resource)
-otlp_exporter = OTLPSpanExporter()
-provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-trace.set_tracer_provider(provider)
 
 ROLE_OVERRIDES = {
     "GET:/aabhar/v1/recognitions/reviews":                    ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
@@ -66,20 +55,37 @@ ROUTE_TITLES = {
     "POST:/aabhar/v1/recognitions/digest/send":               "Send Recognition Digest",
 }
 
+
+async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+    """Handles category code or unique constraint collisions."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "A database constraint was violated. Category code or name already exists."},
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_with_retry()
-    print("Recognition Service: 🟢 Database Connected")
+    # 1. Connect and verify PostgreSQL via SQLAlchemy
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    print("Recognition Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
+    # 2. Redis Connection
     try:
         await connect_redis()
         print("Recognition Service: ☑️  Redis Connected")
     except Exception as exc:
         print(f"Recognition Service: ⚠️  Redis unavailable ({exc})")
 
-    sender      = EmailSender(SMTPConfig.from_env())
-    digest_task = asyncio.create_task(digest_worker_loop(db, sender))
+    # 3. Background Digest Worker
+    sender = EmailSender(SMTPConfig.from_env())
+    digest_task = asyncio.create_task(
+        digest_worker_loop(async_session_factory, sender),
+        name="digest_worker",
+    )
 
+    # 4. Route Permissions Registration
     await register_app_routes(
         app,
         default_roles=["SUPER_ADMIN", "HR_ADMIN"],
@@ -89,6 +95,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean shutdown
     digest_task.cancel()
     try:
         await digest_task
@@ -97,8 +104,8 @@ async def lifespan(app: FastAPI):
 
     await close_auth_client()
     await disconnect_redis()
-    await db.disconnect()
-    print("Recognition Service: 🔴 Database Disconnected")
+    await engine.dispose()
+    print("Recognition Service: 🔴 Database Disconnected & Pool Disposed")
 
 
 app = FastAPI(
@@ -113,29 +120,27 @@ app = FastAPI(
 
 initialize_cors_and_middleware(app)
 
+
 @app.get("/health", tags=["System"])
 async def health_check():
     return {"status": "healthy", "service": "Recognition Service"}
 
 
-# Middleware & Exceptions
+# Middleware & Exception Handlers
 app.middleware("http")(request_rate_limit_middleware)
-app.add_exception_handler(Exception,               generic_exception_handler)
+app.add_exception_handler(IntegrityError,         sqlalchemy_integrity_error_handler)
+app.add_exception_handler(HTTPException,          http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(HTTPException,           http_exception_handler)
-app.add_exception_handler(UniqueViolationError,    prisma_unique_violation_handler)
+app.add_exception_handler(Exception,              generic_exception_handler)
 
-# CORS MIDDLEWARE REMOVED FROM HERE
-
-app.include_router(recognition_router,       tags=["Reviews"])
-app.include_router(review_categories_router, tags=["Review Categories"])
+# Routers
+app.include_router(recognition_router)
+app.include_router(review_categories_router)
 app.include_router(digest_router)
 app.include_router(internal_router)
 
 # Instrumentation
-FastAPIInstrumentor.instrument_app(
-    app, excluded_urls="health,docs,openapi.json,redoc,internal"
-)
+setup_telemetry(app, "rnr-recognition", excluded_urls="health,docs,openapi.json,redoc,internal")
 
 if __name__ == "__main__":
     import uvicorn

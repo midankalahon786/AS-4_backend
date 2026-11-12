@@ -48,7 +48,8 @@ _prisma_stub.db.route_permissions.find_many = AsyncMock(return_value=[])
 _prisma_stub.db.roles.find_many = AsyncMock(return_value=[])
 
 # Now it is safe to import your project modules
-from src.rewards.router import router, get_db
+from src.rewards.router import router
+from src.core.database import get_db
 from src.common.dependencies import CurrentUser, get_current_user
 
 @pytest.fixture

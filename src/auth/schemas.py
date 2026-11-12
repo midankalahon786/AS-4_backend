@@ -1,71 +1,75 @@
-from pydantic import BaseModel, EmailStr, StringConstraints, field_validator
-from typing import Optional, List, Annotated
-from uuid import UUID
+"""
+src/auth/schemas.py
+───────────────────
+Pydantic v2 request and response schemas for the Auth microservice.
+"""
 from datetime import date
+from typing import Annotated
+from uuid import UUID
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    StringConstraints,
+    field_validator,
+)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Employee DTOs
+# ══════════════════════════════════════════════════════════════
+
+class EmployeeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    employee_id: UUID
+    username: str
+    email: EmailStr
+    designation_id: UUID | None = None
+    department_id: UUID | None = None
+    must_change_password: bool = True
+
+
+# ══════════════════════════════════════════════════════════════
+#  Registration & Authentication Schemas
+# ══════════════════════════════════════════════════════════════
 
 class SignUpRequest(BaseModel):
     username: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=255)
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
     ]
     email: EmailStr
     password: Annotated[
         str,
-        StringConstraints(min_length=1, max_length=128)
+        StringConstraints(min_length=8, max_length=128),
     ]
     designation_id: UUID
     department_id: UUID
-    manager_id: Optional[UUID] = None
-    date_of_birth: Optional[date] = None
+    manager_id: UUID | None = None
+    date_of_birth: date | None = None
 
-    # BUG FIX: Normalize email to lowercase, mirroring LoginRequest's
-    # username normalizer (ERR-437). Without this, signup could create
-    # "Jane@Company.com" and "jane@company.com" as two distinct DB rows
-    # (unique constraint is case-sensitive) even though login treats
-    # email case-insensitively — leading to duplicate/unreachable accounts.
     @field_validator("email", mode="before")
     @classmethod
     def normalize_email(cls, v: str) -> str:
         return v.strip().lower() if isinstance(v, str) else v
 
 
-# --- Shared Models ---
-class EmployeeResponse(BaseModel):
-    employee_id: UUID
-    username: str
-    email: EmailStr
-    designation_id: Optional[UUID] = None
-    department_id: Optional[UUID] = None
-    must_change_password: bool = True
-
-    class Config:
-        from_attributes = True
-
-class ChangePasswordRequest(BaseModel):
-    """Request schema for changing password when logged in"""
-    new_password: str
-
-class ChangePasswordResponse(BaseModel):
-    """Response schema for changing password"""
-    message: str
-
-
-
-
-
 class LoginRequest(BaseModel):
-    username: str   # accepts username or email (handled in service)
+    username: str  # Accepts either username or email
     password: str
 
-    # ERR-437 FIX: Normalize username to lowercase so that login is
-    # case-insensitive. "ADMIN@COMPANY.COM" and "admin@company.com"
-    # must resolve to the same account.
     @field_validator("username", mode="before")
     @classmethod
     def normalize_username(cls, v: str) -> str:
-        return v.strip().lower()
+        return v.strip().lower() if isinstance(v, str) else v
 
+
+# ══════════════════════════════════════════════════════════════
+#  Token Lifecycle Schemas
+# ══════════════════════════════════════════════════════════════
 
 class RefreshRequest(BaseModel):
     refresh_token: str
@@ -79,7 +83,6 @@ class TokenValidationRequest(BaseModel):
     token: str
 
 
-# --- Response Schemas ---
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
@@ -89,23 +92,35 @@ class TokenResponse(BaseModel):
 
 
 class TokenValidationResponse(BaseModel):
-    """Response schema for token validation"""
+    """Response schema returned by the token validation endpoint."""
     valid: bool
-    user_id: Optional[str] = None
-    email: Optional[str] = None
-    roles: Optional[List[str]] = None
-    department_id: Optional[str] = None
-    error: Optional[str] = None
+    user_id: UUID | None = None
+    email: EmailStr | None = None
+    roles: list[str] = Field(default_factory=list)
+    department_id: UUID | None = None
+    error: str | None = None
+
+
+# ══════════════════════════════════════════════════════════════
+#  Password Management Schemas
+# ══════════════════════════════════════════════════════════════
+
+class ChangePasswordRequest(BaseModel):
+    """Request schema for an authenticated employee changing their password."""
+    new_password: Annotated[
+        str,
+        StringConstraints(min_length=8, max_length=128),
+    ]
+
+
+class ChangePasswordResponse(BaseModel):
+    message: str
 
 
 class ForgotPasswordRequest(BaseModel):
-    """Request schema for forgot password"""
+    """Request schema to initiate a password reset."""
     email: EmailStr
 
-    # Same fix as SignUpRequest — request_password_reset() does an exact
-    # (case-sensitive) DB lookup on email, so normalize here too or a
-    # legitimate user typing different case than what's stored gets
-    # silently treated as "not found".
     @field_validator("email", mode="before")
     @classmethod
     def normalize_email(cls, v: str) -> str:
@@ -113,16 +128,17 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ForgotPasswordResponse(BaseModel):
-    """Response schema for forgot password"""
     message: str
 
 
 class ResetPasswordRequest(BaseModel):
-    """Request schema for password reset"""
+    """Request schema to finalize a password reset with a reset token."""
     token: str
-    new_password: str
+    new_password: Annotated[
+        str,
+        StringConstraints(min_length=8, max_length=128),
+    ]
 
 
 class ResetPasswordResponse(BaseModel):
-    """Response schema for password reset"""
     message: str

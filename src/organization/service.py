@@ -1,718 +1,529 @@
-# src/organization/service.py
-import math
-from typing import Optional
-from datetime import datetime
-from fastapi import HTTPException, Request
-from src.prisma.client import db
-from src.organization import schemas
-from src.common.audit import audit_ctx
-from src.common.cache import cache_get, cache_set, cache_delete, invalidate_pattern
+"""
+src/organization/service.py
+───────────────────────────
+Organization Service layer decoupled via IOrganizationRepository.
+Handles Departments, Designations, Statuses, and Audit Viewer.
+"""
+from __future__ import annotations
 
-TTL_DEPT_TYPES   = 3600
-TTL_DEPARTMENTS  = 3600
+import logging
+import uuid
+from datetime import datetime
+from typing import Any
+
+from fastapi import HTTPException, Request, status
+
+from src.common.audit import audit_ctx
+from src.common.cache import cache_delete, cache_get, cache_set, invalidate_pattern
+from src.organization import schemas
+from src.organization.interfaces import IOrganizationRepository
+
+logger = logging.getLogger(__name__)
+
+TTL_DEPT_TYPES = 3600
+TTL_DEPARTMENTS = 3600
 TTL_DESIGNATIONS = 3600
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache-key helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _key_dept_types()                              -> str: return "org:department_types"
-def _key_depts(page, limit, is_active, search)     -> str:
+# ── Cache Key Helpers ────────────────────────────────────────[cite: 17]
+def _key_dept_types() -> str:
+    return "org:department_types"
+
+def _key_depts(page: int, limit: int, is_active: bool | None, search: str | None) -> str:
     return f"org:departments:{page}:{limit}:{is_active}:{search}"
-def _key_dept(dept_id: str)                        -> str: return f"org:department:{dept_id}"
-def _key_desigs(page, limit, is_active)            -> str:
+
+def _key_dept(dept_id: uuid.UUID) -> str:
+    return f"org:department:{dept_id}"
+
+def _key_desigs(page: int, limit: int, is_active: bool | None) -> str:
     return f"org:designations:{page}:{limit}:{is_active}"
-def _key_desig(desig_id: str)                      -> str: return f"org:designation:{desig_id}"
 
-async def invalidate_departments() -> None:
-    await invalidate_pattern("org:departments:*")
-    await invalidate_pattern("org:department:*")
-
-async def invalidate_designations() -> None:
-    await invalidate_pattern("org:designations:*")
-    await invalidate_pattern("org:designation:*")
+def _key_desig(desig_id: uuid.UUID) -> str:
+    return f"org:designation:{desig_id}"
 
 
-# ══════════════════════════════════════════════
-#  DEPARTMENT SERVICE
-# ══════════════════════════════════════════════
+class OrganizationService:
+    def __init__(self, repo: IOrganizationRepository) -> None:
+        self.repo = repo
 
-async def list_departments(
-    page: int, limit: int, is_active: Optional[bool], search: Optional[str]
-) -> schemas.DepartmentListResponse:
+    @staticmethod
+    async def invalidate_departments() -> None:
+        await invalidate_pattern("org:departments:*")
+        await invalidate_pattern("org:department:*")
 
-    key    = _key_depts(page, limit, is_active, search)
-    cached = await cache_get(key)
-    if cached is not None:
-        return schemas.DepartmentListResponse(**cached)
+    @staticmethod
+    async def invalidate_designations() -> None:
+        await invalidate_pattern("org:designations:*")
+        await invalidate_pattern("org:designation:*")
 
-    where: dict = {}
-    and_conditions = []
-    if is_active is not None:
-        and_conditions.append({"is_active": is_active})
-    if search:
-        and_conditions.append({
-            "OR": [
-                {"department_name": {"contains": search, "mode": "insensitive"}},
-                {"department_code": {"contains": search, "mode": "insensitive"}},
-            ]
-        })
-    if and_conditions:
-        where["AND"] = and_conditions
+    # ══════════════════════════════════════════════
+    #  Department Types
+    # ══════════════════════════════════════════════
 
-    total       = await db.departments.count(where=where)
-    total_pages = math.ceil(total / limit) if total else 1
-    skip        = (page - 1) * limit
+    async def list_department_types(self) -> list[schemas.DepartmentTypeResponse]:
+        key = _key_dept_types()
+        cached = await cache_get(key)
+        if cached is not None:
+            return [schemas.DepartmentTypeResponse(**t) for t in cached]
 
-    departments = await db.departments.find_many(
-        where=where, skip=skip, take=limit,
-        order={"created_at": "desc"},
-        include={"department_types": True},
-    )
+        types = await self.repo.list_department_types()
+        result = [
+            schemas.DepartmentTypeResponse(
+                department_type_id=t.department_type_id,
+                type_name=t.type_name,
+                type_code=t.type_code,
+            )
+            for t in types
+        ]
+        await cache_set(key, [r.model_dump(mode="json") for r in result], ttl=TTL_DEPT_TYPES)
+        return result
 
-    # Bulk-resolve creator + updater employees in one query
-    actor_ids = list({
-        dept.created_by for dept in departments if dept.created_by
-    } | {
-        dept.updated_by for dept in departments if dept.updated_by
-    })
-    actors_map: dict = {}
-    if actor_ids:
-        actors = await db.employees.find_many(
-            where={"employee_id": {"in": actor_ids}}
+    # ══════════════════════════════════════════════
+    #  Departments
+    # ══════════════════════════════════════════════
+
+    async def list_departments(
+        self,
+        page: int,
+        limit: int,
+        is_active: bool | None,
+        search: str | None,
+    ) -> schemas.DepartmentListResponse:
+        key = _key_depts(page, limit, is_active, search)
+        cached = await cache_get(key)
+        if cached is not None:
+            return schemas.DepartmentListResponse(**cached)
+
+        result = await self.repo.list_departments(
+            page=page, limit=limit, is_active=is_active, search=search
         )
-        actors_map = {str(e.employee_id): e for e in actors}
+        await cache_set(key, result.model_dump(mode="json"), ttl=TTL_DEPARTMENTS)
+        return result
 
-    data = []
-    for dept in departments:
-        dept_type = None
-        if dept.department_types:
-            dept_type = schemas.DepartmentTypeResponse(
-                department_type_id=dept.department_types.department_type_id,
-                type_name=dept.department_types.type_name,
-                type_code=dept.department_types.type_code,
+    async def get_department_detail(
+        self, department_id: uuid.UUID
+    ) -> schemas.DepartmentDetailResponse:
+        key = _key_dept(department_id)
+        cached = await cache_get(key)
+        if cached is not None:
+            return schemas.DepartmentDetailResponse(**cached)
+
+        dept = await self.repo.get_department_detail(department_id)
+        if not dept:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Department not found"
             )
 
-        creator = actors_map.get(str(dept.created_by)) if dept.created_by else None
-        updater = actors_map.get(str(dept.updated_by)) if dept.updated_by else None
+        await cache_set(key, dept.model_dump(mode="json"), ttl=TTL_DEPARTMENTS)
+        return dept
 
-        data.append(schemas.DepartmentListItem(
-            department_id=dept.department_id,
-            department_name=dept.department_name,
-            department_code=dept.department_code,
-            department_type=dept_type,
-            manager=None,
-            is_active=dept.is_active,
-            created_at=dept.created_at,
-            created_by=dept.created_by,
-            created_by_info=schemas.ManagerBriefResponse(
-                employee_id=creator.employee_id,
-                username=creator.username,
-                email=creator.email,
-            ) if creator else None,
-            updated_by=dept.updated_by,
-            updated_by_info=schemas.ManagerBriefResponse(
-                employee_id=updater.employee_id,
-                username=updater.username,
-                email=updater.email,
-            ) if updater else None,
-        ))
-
-    result = schemas.DepartmentListResponse(
-        data=data,
-        pagination=schemas.PaginationMeta(
-            current_page=page, per_page=limit, total=total,
-            total_pages=total_pages,
-            has_next=page < total_pages, has_previous=page > 1,
-        ),
-    )
-    await cache_set(key, result.model_dump(), ttl=TTL_DEPARTMENTS)
-    return result
-
-
-async def get_department_detail(department_id: str) -> schemas.DepartmentDetailResponse:
-    key    = _key_dept(department_id)
-    cached = await cache_get(key)
-    if cached is not None:
-        return schemas.DepartmentDetailResponse(**cached)
-
-    dept = await db.departments.find_unique(
-        where={"department_id": department_id},
-        include={
-            "department_types": True,
-            "employees_employees_department_idTodepartments": True,
-            "employees_departments_created_byToemployees": True,
-            "employees_departments_updated_byToemployees": True,
-        },
-    )
-    if not dept:
-        raise HTTPException(status_code=404, detail="Department not found")
-
-    dept_type = None
-    if dept.department_types:
-        dept_type = schemas.DepartmentTypeResponse(
-            department_type_id=dept.department_types.department_type_id,
-            type_name=dept.department_types.type_name,
-            type_code=dept.department_types.type_code,
+    async def create_department(
+        self,
+        data: schemas.CreateDepartmentRequest,
+        created_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.DepartmentCreatedResponse:
+        existing = await self.repo.get_department_by_name_or_code(
+            data.department_name, data.department_code
         )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Department name or code already exists",
+            )
 
-    emp_list = dept.employees_employees_department_idTodepartments or []
-    creator  = dept.employees_departments_created_byToemployees
-    updater  = dept.employees_departments_updated_byToemployees
+        dept_type = await self.repo.get_department_type_by_id(data.department_type_id)
+        if not dept_type:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Department type not found",
+            )
 
-    result = schemas.DepartmentDetailResponse(
-        department_id=dept.department_id,
-        department_name=dept.department_name,
-        department_code=dept.department_code,
-        department_type=dept_type,
-        manager=None,
-        employee_count=len(emp_list),
-        is_active=dept.is_active,
-        created_at=dept.created_at,
-        updated_at=dept.updated_at,
-        created_by=dept.created_by,
-        created_by_info=schemas.ManagerBriefResponse(
-            employee_id=creator.employee_id,
-            username=creator.username,
-            email=creator.email,
-        ) if creator else None,
-        updated_by=dept.updated_by,
-        updated_by_info=schemas.ManagerBriefResponse(
-            employee_id=updater.employee_id,
-            username=updater.username,
-            email=updater.email,
-        ) if updater else None,
-    )
-    await cache_set(key, result.model_dump(), ttl=TTL_DEPARTMENTS)
-    return result
-
-
-async def create_department(
-    data: schemas.CreateDepartmentRequest,
-    created_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.DepartmentCreatedResponse:
-
-    existing = await db.departments.find_first(where={
-        "OR": [
-            {"department_name": data.department_name},
-            {"department_code": data.department_code},
-        ]
-    })
-    if existing:
-        raise HTTPException(status_code=400, detail="Department name or code already exists")
-
-    dept_type = await db.department_types.find_unique(
-        where={"department_type_id": str(data.department_type_id)}
-    )
-    if not dept_type:
-        raise HTTPException(status_code=400, detail="Department type not found")
-
-    new_dept = None
-    async with audit_ctx(
-        user_id    = created_by_id,
-        request    = request,
-        table_name = "departments",
-        record_id  = lambda: str(new_dept.department_id),
-        operation  = "INSERT",
-        new_values = lambda: new_dept.model_dump(),
-    ):
-        new_dept = await db.departments.create(
-            data={
-                "department_name":    data.department_name,
-                "department_code":    data.department_code,
+        new_dept = None
+        async with audit_ctx(
+            user_id=str(created_by_id),
+            request=request,
+            table_name="departments",
+            record_id=lambda: str(new_dept.department_id) if new_dept else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
+                "department_name": data.department_name,
+                "department_code": data.department_code,
                 "department_type_id": str(data.department_type_id),
-                "is_active":          True,
-                "created_by":         created_by_id,
-                "updated_by":         created_by_id,
-                "updated_at":         datetime.now(),
             },
-            include={
-                "department_types": True,
-                "employees_departments_created_byToemployees": True,
+        ):
+            new_dept = await self.repo.create_department(data, created_by_id)
+
+        await self.invalidate_departments()
+
+        dept_type_resp = (
+            schemas.DepartmentTypeResponse.model_validate(new_dept.department_type)
+            if new_dept.department_type
+            else None
+        )
+
+        return schemas.DepartmentCreatedResponse(
+            department_id=new_dept.department_id,
+            department_name=new_dept.department_name,
+            department_code=new_dept.department_code,
+            department_type=dept_type_resp,
+            is_active=new_dept.is_active,
+            created_at=new_dept.created_at,
+            created_by=new_dept.created_by,
+        )
+
+    async def update_department(
+        self,
+        department_id: uuid.UUID,
+        data: schemas.UpdateDepartmentRequest,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.DepartmentUpdatedResponse:
+        existing = await self.repo.get_department_detail(department_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Department not found"
+            )
+
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid fields to update",
+            )
+
+        if "department_type_id" in update_data and update_data["department_type_id"]:
+            dept_type = await self.repo.get_department_type_by_id(
+                update_data["department_type_id"]
+            )
+            if not dept_type:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Department type not found",
+                )
+
+        old_snapshot = {
+            "department_name": existing.department_name,
+            "department_code": existing.department_code,
+            "is_active": existing.is_active,
+        }
+
+        updated = None
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="departments",
+            record_id=str(department_id),
+            operation="UPDATE",
+            old_values=old_snapshot,
+            new_values=lambda: {
+                k: str(v) if isinstance(v, uuid.UUID) else v
+                for k, v in update_data.items()
             },
+        ):
+            updated = await self.repo.update_department(
+                department_id=department_id,
+                update_data=update_data,
+                updated_by_id=updated_by_id,
+            )
+
+        await cache_delete(_key_dept(department_id))
+        await invalidate_pattern("org:departments:*")
+
+        dept_type_resp = (
+            schemas.DepartmentTypeResponse.model_validate(updated.department_type)
+            if updated and updated.department_type
+            else None
         )
 
-    await invalidate_departments()
-
-    dept_type_resp = None
-    if new_dept.department_types:
-        dept_type_resp = schemas.DepartmentTypeResponse(
-            department_type_id=new_dept.department_types.department_type_id,
-            type_name=new_dept.department_types.type_name,
-            type_code=new_dept.department_types.type_code,
+        return schemas.DepartmentUpdatedResponse(
+            department_id=updated.department_id,
+            department_name=updated.department_name,
+            department_code=updated.department_code,
+            department_type=dept_type_resp,
+            is_active=updated.is_active,
+            updated_at=updated.updated_at,
+            updated_by=updated.updated_by,
         )
 
-    creator = new_dept.employees_departments_created_byToemployees
+    # ══════════════════════════════════════════════
+    #  Designations
+    # ══════════════════════════════════════════════
 
-    return schemas.DepartmentCreatedResponse(
-        department_id=new_dept.department_id,
-        department_name=new_dept.department_name,
-        department_code=new_dept.department_code,
-        department_type=dept_type_resp,
-        manager=None,
-        is_active=new_dept.is_active,
-        created_at=new_dept.created_at,
-        created_by=new_dept.created_by,
-        created_by_info=schemas.ManagerBriefResponse(
-            employee_id=creator.employee_id,
-            username=creator.username,
-            email=creator.email,
-        ) if creator else None,
-    )
+    async def list_designations(
+        self,
+        page: int,
+        limit: int,
+        is_active: bool | None,
+    ) -> schemas.DesignationListResponse:
+        key = _key_desigs(page, limit, is_active)
+        cached = await cache_get(key)
+        if cached is not None:
+            return schemas.DesignationListResponse(**cached)
 
-
-async def update_department(
-    department_id: str,
-    data: schemas.UpdateDepartmentRequest,
-    updated_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.DepartmentUpdatedResponse:
-
-    existing = await db.departments.find_unique(where={"department_id": department_id})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Department not found")
-
-    old_snapshot = existing.model_dump()
-
-    update_data = data.model_dump(exclude_unset=True)
-    if "department_type_id" in update_data and update_data["department_type_id"]:
-        update_data["department_type_id"] = str(update_data["department_type_id"])
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-
-    update_data["updated_by"] = updated_by_id
-    update_data["updated_at"] = datetime.now()
-
-    updated = None
-    async with audit_ctx(
-        user_id    = updated_by_id,
-        request    = request,
-        table_name = "departments",
-        record_id  = department_id,
-        operation  = "UPDATE",
-        old_values = old_snapshot,
-        new_values = lambda: updated.model_dump(),
-    ):
-        updated = await db.departments.update(
-            where={"department_id": department_id},
-            data=update_data,
-            include={
-                "department_types": True,
-                "employees_departments_updated_byToemployees": True,
-            },
+        result = await self.repo.list_designations(
+            page=page, limit=limit, is_active=is_active
         )
+        await cache_set(key, result.model_dump(mode="json"), ttl=TTL_DESIGNATIONS)
+        return result
 
-    await cache_delete(_key_dept(department_id))
-    await invalidate_pattern("org:departments:*")
+    async def get_designation_detail(
+        self, designation_id: uuid.UUID
+    ) -> schemas.DesignationDetailResponse:
+        key = _key_desig(designation_id)
+        cached = await cache_get(key)
+        if cached is not None:
+            return schemas.DesignationDetailResponse(**cached)
 
-    dept_type_resp = None
-    if updated.department_types:
-        dept_type_resp = schemas.DepartmentTypeResponse(
-            department_type_id=updated.department_types.department_type_id,
-            type_name=updated.department_types.type_name,
-            type_code=updated.department_types.type_code,
+        desig = await self.repo.get_designation_detail(designation_id)
+        if not desig:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Designation not found"
+            )
+
+        await cache_set(key, desig.model_dump(mode="json"), ttl=TTL_DESIGNATIONS)
+        return desig
+
+    async def create_designation(
+        self,
+        data: schemas.CreateDesignationRequest,
+        created_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.DesignationListItem:
+        existing = await self.repo.get_designation_by_name_or_code(
+            data.designation_name, data.designation_code
         )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Designation name or code already exists",
+            )
 
-    updater = updated.employees_departments_updated_byToemployees
-
-    return schemas.DepartmentUpdatedResponse(
-        department_id=updated.department_id,
-        department_name=updated.department_name,
-        department_code=updated.department_code,
-        department_type=dept_type_resp,
-        manager=None,
-        is_active=updated.is_active,
-        updated_at=updated.updated_at,
-        updated_by=updated.updated_by,
-        updated_by_info=schemas.ManagerBriefResponse(
-            employee_id=updater.employee_id,
-            username=updater.username,
-            email=updater.email,
-        ) if updater else None,
-    )
-
-async def list_department_types() -> list[schemas.DepartmentTypeResponse]:
-    key    = _key_dept_types()
-    cached = await cache_get(key)
-    if cached is not None:
-        return [schemas.DepartmentTypeResponse(**t) for t in cached]
-
-    types  = await db.department_types.find_many(order={"type_name": "asc"})
-    result = [
-        schemas.DepartmentTypeResponse(
-            department_type_id=t.department_type_id,
-            type_name=t.type_name,
-            type_code=t.type_code,
-        )
-        for t in types
-    ]
-    await cache_set(key, [r.model_dump() for r in result], ttl=TTL_DEPT_TYPES)
-    return result
-
-
-# ══════════════════════════════════════════════
-#  DESIGNATION SERVICE
-# ══════════════════════════════════════════════
-
-async def list_designations(
-    page: int, limit: int, is_active: Optional[bool]
-) -> schemas.DesignationListResponse:
-
-    key    = _key_desigs(page, limit, is_active)
-    cached = await cache_get(key)
-    if cached is not None:
-        return schemas.DesignationListResponse(**cached)
-
-    where: dict = {}
-    if is_active is not None:
-        where["is_active"] = is_active
-
-    total       = await db.designations.count(where=where)
-    total_pages = math.ceil(total / limit) if total else 1
-    skip        = (page - 1) * limit
-
-    designations = await db.designations.find_many(
-        where=where, skip=skip, take=limit, order={"level": "asc"}
-    )
-    data = [
-        schemas.DesignationListItem(
-            designation_id=d.designation_id,
-            designation_name=d.designation_name,
-            designation_code=d.designation_code,
-            level=d.level,
-            is_active=d.is_active,
-            created_at=d.created_at,
-        )
-        for d in designations
-    ]
-    result = schemas.DesignationListResponse(
-        data=data,
-        pagination=schemas.PaginationMeta(
-            current_page=page, per_page=limit, total=total,
-            total_pages=total_pages,
-            has_next=page < total_pages, has_previous=page > 1,
-        ),
-    )
-    await cache_set(key, result.model_dump(), ttl=TTL_DESIGNATIONS)
-    return result
-
-
-async def get_designation_detail(designation_id: str) -> schemas.DesignationDetailResponse:
-    key    = _key_desig(designation_id)
-    cached = await cache_get(key)
-    if cached is not None:
-        return schemas.DesignationDetailResponse(**cached)
-
-    desig = await db.designations.find_unique(
-        where={"designation_id": designation_id},
-        include={"employees_employees_designation_idTodesignations": True},
-    )
-    if not desig:
-        raise HTTPException(status_code=404, detail="Designation not found")
-
-    emp_list = desig.employees_employees_designation_idTodesignations or []
-    result   = schemas.DesignationDetailResponse(
-        designation_id=desig.designation_id,
-        designation_name=desig.designation_name,
-        designation_code=desig.designation_code,
-        level=desig.level,
-        description=desig.description,
-        employee_count=len(emp_list),
-        is_active=desig.is_active,
-        created_at=desig.created_at,
-        updated_at=desig.updated_at,
-    )
-    await cache_set(key, result.model_dump(), ttl=TTL_DESIGNATIONS)
-    return result
-
-
-async def create_designation(
-    data: schemas.CreateDesignationRequest,
-    created_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.DesignationListItem:
-
-    existing = await db.designations.find_first(where={
-        "OR": [
-            {"designation_name": data.designation_name},
-            {"designation_code": data.designation_code},
-        ]
-    })
-    if existing:
-        raise HTTPException(status_code=400, detail="Designation name or code already exists")
-
-    new_desig = None
-    async with audit_ctx(
-        user_id    = created_by_id,
-        request    = request,
-        table_name = "designations",
-        record_id  = lambda: str(new_desig.designation_id),
-        operation  = "INSERT",
-        new_values = lambda: new_desig.model_dump(),
-    ):
-        new_desig = await db.designations.create(
-            data={
+        new_desig = None
+        async with audit_ctx(
+            user_id=str(created_by_id),
+            request=request,
+            table_name="designations",
+            record_id=lambda: str(new_desig.designation_id) if new_desig else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
                 "designation_name": data.designation_name,
                 "designation_code": data.designation_code,
-                "level":            data.level,
-                "description":      data.description,
-                "created_by":       created_by_id,
-                "updated_by":       created_by_id,
-                "updated_at":       datetime.now(),
-            }
+                "level": data.level,
+            },
+        ):
+            new_desig = await self.repo.create_designation(data, created_by_id)
+
+        await self.invalidate_designations()
+        return schemas.DesignationListItem(
+            designation_id=new_desig.designation_id,
+            designation_name=new_desig.designation_name,
+            designation_code=new_desig.designation_code,
+            level=new_desig.level,
+            is_active=True,
+            created_at=new_desig.created_at,
         )
 
-    await invalidate_designations()
-    return schemas.DesignationListItem(
-        designation_id=new_desig.designation_id,
-        designation_name=new_desig.designation_name,
-        designation_code=new_desig.designation_code,
-        level=new_desig.level,
-        is_active=True,
-        created_at=new_desig.created_at,
-    )
+    async def update_designation(
+        self,
+        designation_id: uuid.UUID,
+        data: schemas.UpdateDesignationRequest,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.DesignationDetailResponse:
+        existing = await self.repo.get_designation_detail(designation_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Designation not found"
+            )
 
+        update_data = {
+            k: v
+            for k, v in data.model_dump(exclude_unset=True).items()
+            if k not in ("is_active",)
+        }
+        if not update_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid fields to update",
+            )
 
-async def update_designation(
-    designation_id: str,
-    data: schemas.UpdateDesignationRequest,
-    updated_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.DesignationDetailResponse:
+        new_code = update_data.get("designation_code")
+        if new_code and new_code != existing.designation_code:
+            conflict = await self.repo.check_designation_code_conflict(
+                new_code, designation_id
+            )
+            if conflict:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Designation code '{new_code}' is already in use.",
+                )
 
-    existing = await db.designations.find_unique(where={"designation_id": designation_id})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Designation not found")
+        old_snapshot = {
+            "designation_name": existing.designation_name,
+            "designation_code": existing.designation_code,
+            "level": existing.level,
+        }
 
-    old_snapshot = existing.model_dump()
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="designations",
+            record_id=str(designation_id),
+            operation="UPDATE",
+            old_values=old_snapshot,
+            new_values=lambda: update_data,
+        ):
+            await self.repo.update_designation(
+                designation_id=designation_id,
+                update_data=update_data,
+                updated_by_id=updated_by_id,
+            )
 
-    update_data = {k: v for k, v in data.model_dump(exclude_unset=True).items()
-                   if k not in ("is_active",)}
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
+        await cache_delete(_key_desig(designation_id))
+        await invalidate_pattern("org:designations:*")
+        return await self.get_designation_detail(designation_id)
 
-    new_code = update_data.get("designation_code")
-    if new_code and new_code != existing.designation_code:
-        conflict = await db.designations.find_first(where={
-            "designation_code": new_code,
-            "NOT": {"designation_id": designation_id},
-        })
-        if conflict:
-            raise HTTPException(status_code=400,
-                                detail=f"Designation code '{new_code}' is already in use.")
+    # ══════════════════════════════════════════════
+    #  Status Master
+    # ══════════════════════════════════════════════
 
-    update_data["updated_by"] = updated_by_id
-    update_data["updated_at"] = datetime.now()
+    async def list_statuses(
+        self, entity_type: str | None = None
+    ) -> list[schemas.StatusResponse]:
+        statuses = await self.repo.list_statuses(entity_type)
+        return [schemas.StatusResponse.model_validate(st) for st in statuses]
 
-    updated = None
-    async with audit_ctx(
-        user_id    = updated_by_id,
-        request    = request,
-        table_name = "designations",
-        record_id  = designation_id,
-        operation  = "UPDATE",
-        old_values = old_snapshot,
-        new_values = lambda: updated.model_dump(),
-    ):
-        updated = await db.designations.update(
-            where={"designation_id": designation_id},
-            data=update_data,
+    async def get_status(self, status_id: uuid.UUID) -> schemas.StatusDetailResponse:
+        st = await self.repo.get_status_by_id(status_id)
+        if not st:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Status not found"
+            )
+        return schemas.StatusDetailResponse(
+            status_id=st.status_id,
+            status_code=st.status_code,
+            status_name=st.status_name,
+            description=st.description,
+            entity_type=st.entity_type,
+            created_at=st.created_at,
+            updated_at=st.updated_at,
         )
 
-    await cache_delete(_key_desig(designation_id))
-    await invalidate_pattern("org:designations:*")
-    return await get_designation_detail(designation_id)
+    async def create_status(
+        self,
+        data: schemas.CreateStatusRequest,
+        created_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.StatusDetailResponse:
+        existing = await self.repo.get_status_by_code(data.status_code)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="CONFLICT – status_code already exists",
+            )
 
-
-# ══════════════════════════════════════════════
-#  STATUS MASTER SERVICE
-# ══════════════════════════════════════════════
-
-async def list_statuses(entity_type: Optional[str] = None) -> list[schemas.StatusResponse]:
-    where = {}
-    if entity_type:
-        where["entity_type"] = entity_type.upper()
-    statuses = await db.status_master.find_many(where=where, order={"entity_type": "asc"})
-    return [
-        schemas.StatusResponse(
-            status_id=st.status_id, status_code=st.status_code,
-            status_name=st.status_name, description=st.description,
-            entity_type=st.entity_type, created_at=st.created_at,
-        )
-        for st in statuses
-    ]
-
-
-async def get_status(status_id: str) -> schemas.StatusDetailResponse:
-    st = await db.status_master.find_unique(where={"status_id": status_id})
-    if not st:
-        raise HTTPException(status_code=404, detail="Status not found")
-    return schemas.StatusDetailResponse(
-        status_id=st.status_id, status_code=st.status_code,
-        status_name=st.status_name, description=st.description,
-        entity_type=st.entity_type, created_at=st.created_at,
-        updated_at=st.updated_at,
-    )
-
-
-async def create_status(
-    data: schemas.CreateStatusRequest,
-    created_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.StatusDetailResponse:
-
-    existing = await db.status_master.find_unique(where={"status_code": data.status_code})
-    if existing:
-        raise HTTPException(status_code=409, detail="CONFLICT – status_code already exists")
-
-    new_st = None
-    async with audit_ctx(
-        user_id    = created_by_id,
-        request    = request,
-        table_name = "status_master",
-        record_id  = lambda: str(new_st.status_id),
-        operation  = "INSERT",
-        new_values = lambda: new_st.model_dump(),
-    ):
-        new_st = await db.status_master.create(
-            data={
+        new_st = None
+        async with audit_ctx(
+            user_id=str(created_by_id),
+            request=request,
+            table_name="status_master",
+            record_id=lambda: str(new_st.status_id) if new_st else "UNKNOWN",
+            operation="INSERT",
+            new_values=lambda: {
                 "status_code": data.status_code,
                 "status_name": data.status_name,
-                "description": data.description,
                 "entity_type": data.entity_type,
-                "created_by":  created_by_id,
-                "updated_by":  created_by_id,
-                "updated_at":  datetime.now(),
-            }
+            },
+        ):
+            new_st = await self.repo.create_status(data, created_by_id)
+
+        return schemas.StatusDetailResponse(
+            status_id=new_st.status_id,
+            status_code=new_st.status_code,
+            status_name=new_st.status_name,
+            description=new_st.description,
+            entity_type=new_st.entity_type,
+            created_at=new_st.created_at,
+            updated_at=new_st.updated_at,
         )
 
-    return schemas.StatusDetailResponse(
-        status_id=new_st.status_id, status_code=new_st.status_code,
-        status_name=new_st.status_name, description=new_st.description,
-        entity_type=new_st.entity_type, created_at=new_st.created_at,
-        updated_at=new_st.updated_at,
-    )
+    async def update_status(
+        self,
+        status_id: uuid.UUID,
+        data: schemas.UpdateStatusRequest,
+        updated_by_id: uuid.UUID,
+        request: Request | None = None,
+    ) -> schemas.StatusDetailResponse:
+        existing = await self.repo.get_status_by_id(status_id)
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Status not found"
+            )
 
+        update_data = data.model_dump(exclude_unset=True)
+        old_snapshot = {
+            "status_name": existing.status_name,
+            "description": existing.description,
+        }
 
-async def update_status(
-    status_id: str,
-    data: schemas.UpdateStatusRequest,
-    updated_by_id: str,
-    request: Optional[Request] = None,
-) -> schemas.StatusDetailResponse:
+        updated = None
+        async with audit_ctx(
+            user_id=str(updated_by_id),
+            request=request,
+            table_name="status_master",
+            record_id=str(status_id),
+            operation="UPDATE",
+            old_values=old_snapshot,
+            new_values=lambda: update_data,
+        ):
+            updated = await self.repo.update_status(
+                status_id=status_id,
+                update_data=update_data,
+                updated_by_id=updated_by_id,
+            )
 
-    existing = await db.status_master.find_unique(where={"status_id": status_id})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Status not found")
-
-    old_snapshot = existing.model_dump()
-    update_data  = data.model_dump(exclude_unset=True)
-    update_data["updated_by"] = updated_by_id
-    update_data["updated_at"] = datetime.now()
-
-    updated = None
-    async with audit_ctx(
-        user_id    = updated_by_id,
-        request    = request,
-        table_name = "status_master",
-        record_id  = status_id,
-        operation  = "UPDATE",
-        old_values = old_snapshot,
-        new_values = lambda: updated.model_dump(),
-    ):
-        updated = await db.status_master.update(
-            where={"status_id": status_id}, data=update_data
+        return schemas.StatusDetailResponse(
+            status_id=updated.status_id,
+            status_code=updated.status_code,
+            status_name=updated.status_name,
+            description=updated.description,
+            entity_type=updated.entity_type,
+            created_at=updated.created_at,
+            updated_at=updated.updated_at,
         )
 
-    return schemas.StatusDetailResponse(
-        status_id=updated.status_id, status_code=updated.status_code,
-        status_name=updated.status_name, description=updated.description,
-        entity_type=updated.entity_type, created_at=updated.created_at,
-        updated_at=updated.updated_at,
-    )
+    # ══════════════════════════════════════════════
+    #  Audit Logs Viewer
+    # ══════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════
-#  AUDIT LOGS SERVICE  (read-only viewer)
-# ══════════════════════════════════════════════
-
-async def list_audit_logs(
-    page: int, limit: int,
-    table_name: Optional[str], record_id: Optional[str],
-    operation_type: Optional[str], performed_by: Optional[str],
-    start_date: Optional[datetime], end_date: Optional[datetime],
-) -> dict:
-    where: dict = {}
-    if table_name:      where["table_name"]     = {"contains": table_name, "mode": "insensitive"}
-    if record_id:       where["record_id"]       = record_id
-    if operation_type:  where["operation_type"]  = {"contains": operation_type.upper()}
-    if performed_by:    where["performed_by"]    = performed_by
-    if start_date or end_date:
-        where["performed_at"] = {}
-        if start_date: where["performed_at"]["gte"] = start_date
-        if end_date:   where["performed_at"]["lte"] = end_date
-
-    total       = await db.audit_log.count(where=where)
-    total_pages = math.ceil(total / limit) if total else 1
-    skip        = (page - 1) * limit
-
-    # Fetch logs WITHOUT include — Prisma Python's include on a required
-    # relation compiles to INNER JOIN, silently dropping any audit_log row
-    # whose performed_by UUID has no matching employees record (e.g. sentinel
-    # system UUID, or rows written by background consumers before the employee
-    # relation can be resolved). We do a separate bulk employee lookup instead.
-    logs = await db.audit_log.find_many(
-        where=where, skip=skip, take=limit,
-        order={"performed_at": "desc"},
-    )
-
-    # Bulk-resolve employee names in one query
-    performer_ids = list({log.performed_by for log in logs})
-    employees_map: dict = {}
-    if performer_ids:
-        emps = await db.employees.find_many(
-            where={"employee_id": {"in": performer_ids}}
+    async def list_audit_logs(
+        self,
+        page: int,
+        limit: int,
+        table_name: str | None,
+        record_id: uuid.UUID | None,
+        operation_type: str | None,
+        performed_by: uuid.UUID | None,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> schemas.AuditLogListResponse:
+        return await self.repo.list_audit_logs(
+            page=page,
+            limit=limit,
+            table_name=table_name,
+            record_id=record_id,
+            operation_type=operation_type,
+            performed_by=performed_by,
+            start_date=start_date,
+            end_date=end_date,
         )
-        employees_map = {str(e.employee_id): e for e in emps}
 
-    data = [
-        schemas.AuditLogResponse(
-            audit_id=log.audit_id, table_name=log.table_name,
-            record_id=log.record_id, operation_type=log.operation_type,
-            old_values=log.old_values, new_values=log.new_values,
-            performed_by=log.performed_by, performed_at=log.performed_at,
-            ip_address=log.ip_address, user_agent=log.user_agent,
-            employee_name=(employees_map[log.performed_by].username
-                           if log.performed_by in employees_map else None),
-            employee_email=(employees_map[log.performed_by].email
-                            if log.performed_by in employees_map else None),
-        )
-        for log in logs
-    ]
-
-    return {
-        "data": data,
-        "pagination": schemas.PaginationMeta(
-            current_page=page, per_page=limit, total=total,
-            total_pages=total_pages,
-            has_next=page < total_pages, has_previous=page > 1,
-        ),
-    }
-
-
-async def get_audit_log(audit_id: str) -> schemas.AuditLogResponse:
-    log = await db.audit_log.find_unique(where={"audit_id": audit_id})
-    if not log:
-        raise HTTPException(status_code=404, detail="Audit log entry not found.")
-    # Separate lookup — avoids INNER JOIN dropping rows with unresolved performed_by
-    emp = await db.employees.find_unique(where={"employee_id": log.performed_by})
-    return schemas.AuditLogResponse(
-        audit_id=log.audit_id, table_name=log.table_name,
-        record_id=log.record_id, operation_type=log.operation_type,
-        old_values=log.old_values, new_values=log.new_values,
-        performed_by=log.performed_by, performed_at=log.performed_at,
-        ip_address=log.ip_address, user_agent=log.user_agent,
-        employee_name=emp.username if emp else None,
-        employee_email=emp.email   if emp else None,
-    )
+    async def get_audit_log(self, audit_id: uuid.UUID) -> schemas.AuditLogResponse:
+        log = await self.repo.get_audit_log(audit_id)
+        if not log:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Audit log entry not found.",
+            )
+        return log

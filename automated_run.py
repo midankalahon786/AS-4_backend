@@ -3,8 +3,25 @@
 import subprocess
 import sys
 import os
+import logging
+from datetime import datetime
+import socket
+
+LOG_DIR = "logger"
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+LOG_FILE = os.path.join(LOG_DIR, f"aabhar_setup{timestamp}.log")
 
 PYTHON_VERSION_REQUIRED = "3.10"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 def run_command(command, env=None):
     result = subprocess.run(command, shell=True, env=env)
@@ -55,6 +72,33 @@ def dependencies_installation():
     run_command(f"{python_path} -m pip install --upgrade pip")
     run_command(f"{python_path} -m pip cache purge")
     run_command(f"{python_path} -m pip install -r requirements.txt")
+
+def check_database():
+    logger.info("🔍 Reading database config from .env...")
+    host = "localhost"
+    port = 5444
+
+    if os.path.exists(".env"):
+        with open(".env", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("DATABASE_URL="):
+                    try:
+                        address_part = line.split("@")[1].split("/")[0]
+                        host = address_part.split(":")[0]
+                        port = int(address_part.split(":")[1])
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not parse DATABASE_URL: {e}")
+                    break
+
+    logger.info(f"🔍 Pinging remote database on {host}:{port}...")
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            logger.info(f"✅ Database is reachable on {host}:{port}.")
+    except OSError:
+        logger.error(f"❌ Database connection failed on {host}:{port}.")
+        logger.error("⚠️ Ensure your remote PostgreSQL instance is running.")
+        sys.exit(1)
 
 def prisma_generate():
     print("\n⚙️ Generating Prisma client...\n")
@@ -140,9 +184,10 @@ switch = {
     "2": venv_create,
     "3": venv_activate,
     "4": dependencies_installation,
-    "5": prisma_generate,
-    "6": run_all,
-    "7": exit_program
+    "5": check_database,
+    "6": prisma_generate,
+    "7": run_all,
+    "8": exit_program
 }
 
 if __name__ == "__main__":
@@ -163,9 +208,10 @@ if __name__ == "__main__":
         print("2. Create Virtual Environment (Python 3.10)")
         print("3. Activate Virtual Environment {script will exit & rerun the automated_run.py in new venv activated terminal}")
         print("4. Install Dependencies")
-        print("5. Prisma Generate")
-        print("6. Run Full Setup { recommended }")
-        print("7. Exit + Activate venv { recommended, will only work if this script was ran via dev.ps1}")
+        print("5. Database verification")
+        print("6. Prisma Generate")
+        print("7. Run Full Setup { recommended }")
+        print("8. Exit + Activate venv { recommended, will only work if this script was ran via dev.ps1}")
     
         choice = input("\nChoose option (1-7): ").strip()
         action = switch.get(choice)

@@ -109,7 +109,7 @@ class TestDependencies:
     @pytest.mark.asyncio
     @patch(f"{DEP}.cache_get", AsyncMock(return_value=None))
     @patch(f"{DEP}.get_auth_client")
-    @patch(f"{DEP}.jwt.decode")
+    @patch(f"{DEP}.decode_token")
     async def test_get_current_user_fallback_local_jwt(self, mock_jwt, mock_get_client, mock_request):
         mock_client = AsyncMock()
         mock_client.post.side_effect = httpx.RequestError("Auth Service Down")
@@ -136,16 +136,23 @@ class TestDependencies:
 
     @pytest.mark.asyncio
     @patch(f"{DEP}.cache_get", AsyncMock(return_value=None))
-    @patch(f"{DEP}.db.route_permissions.find_many", new_callable=AsyncMock) # Fixed: Force AsyncMock
-    async def test_check_permission_forbidden(self, mock_find, mock_request):
+    async def test_check_permission_forbidden(self, mock_request):
         user = CurrentUser(id="u1", email="u@b.com", roles=["EMPLOYEE"])
         
         mock_perm = MagicMock()
-        mock_perm.roles.role_code = "MANAGER"
-        mock_find.return_value = [mock_perm]
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_route_permission(mock_request, user)
+        mock_perm.role.role_code = "MANAGER"
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
+
+        res = MagicMock()
+        res.scalars.return_value.all.return_value = [mock_perm]
+        mock_session.execute = AsyncMock(return_value=res)
+
+        with patch("src.common.dependencies.async_session_factory", return_value=mock_session):
+            with pytest.raises(HTTPException) as exc:
+                await check_route_permission(mock_request, user)
         
         assert exc.value.status_code == 403
 

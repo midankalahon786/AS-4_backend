@@ -90,3 +90,5 @@ test_response_times.py
 
 
 CLAUDE.md
+fixes/
+.logs/

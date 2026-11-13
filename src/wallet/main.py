@@ -159,7 +159,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Wallet Service",
     version="1.0.0",
-    root_path="/aabhar/v1/wallets",
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",

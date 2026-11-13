@@ -151,7 +151,6 @@ app = FastAPI(
     title="Analytics Service",
     description="Dashboard analytics and event tracking powered by SQLAlchemy 2.0 and Redis",
     version="1.0.0",
-    root_path="/aabhar/v1/analytics",
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",

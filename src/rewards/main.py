@@ -104,7 +104,6 @@ app = FastAPI(
     title="Reward Microservice",
     description="API for managing the reward catalog, categories, and point redemptions.",
     version="1.0.0",
-    root_path="/aabhar/v1/rewards",
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",

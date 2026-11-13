@@ -208,7 +208,6 @@ async def _load_route_registry(app: FastAPI) -> None:
 app = FastAPI(
     title="Employee Service",
     version="1.0.0",
-    root_path="/aabhar/v1/employees",
     openapi_url="/openapi.json",
     docs_url="/docs",
     lifespan=lifespan,

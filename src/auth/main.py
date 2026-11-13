@@ -123,7 +123,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Auth Service",
     version="1.0.0",
-    root_path="/aabhar/v1/auth",
     openapi_url="/openapi.json",
     docs_url="/docs",
     lifespan=lifespan,

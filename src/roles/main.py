@@ -111,7 +111,6 @@ app = FastAPI(
     title="Roles & Permissions Service",
     version="1.0.0",
     lifespan=lifespan,
-    root_path="/aabhar/v1/roles",
     openapi_url="/openapi.json",
     docs_url="/docs",
 )

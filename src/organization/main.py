@@ -135,7 +135,6 @@ app = FastAPI(
     title="Organization Service",
     description="Microservice for handling company structure: Departments, Designations, and Statuses",
     version="1.0.0",
-    root_path="/aabhar/v1/organizations",
     openapi_url="/openapi.json",
     docs_url="/docs",
     lifespan=lifespan,

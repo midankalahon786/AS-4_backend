@@ -64,28 +64,41 @@ async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) ->
     )
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Connect and verify PostgreSQL via SQLAlchemy
+    # 1. Verify PostgreSQL connection
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     print("Recognition Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
 
-    # 2. Redis Connection
+    # 2. Redis setup
+    redis_connected = False
     try:
         await connect_redis()
-        print("Recognition Service: ☑️  Redis Connected")
+        redis_connected = True
+        print("Recognition Service: ☑️ Redis Connected")
     except Exception as exc:
-        print(f"Recognition Service: ⚠️  Redis unavailable ({exc})")
+        print(f"Recognition Service: ⚠️ Redis unavailable ({exc})")
 
-    # 3. Background Digest Worker
-    sender = EmailSender(SMTPConfig.from_env())
-    digest_task = asyncio.create_task(
-        digest_worker_loop(async_session_factory, sender),
-        name="digest_worker",
-    )
+    # 3. Optional SMTP setup
+    sender = None
+    try:
+        sender = EmailSender(SMTPConfig.from_env())
+        print("Recognition Service: 📧 SMTP configured")
+    except (KeyError, ValueError) as exc:
+        print(f"Recognition Service: SMTP disabled — configuration unavailable ({exc})")
 
-    # 4. Route Permissions Registration
+    # 4. Background Digest Worker
+    digest_task = None
+    if sender is not None:
+        digest_task = asyncio.create_task(
+            digest_worker_loop(async_session_factory, sender),
+            name="digest_worker",
+        )
+        print("Recognition Service: Digest worker started")
+
+    # 5. Route Permissions Registration
     await register_app_routes(
         app,
         default_roles=["SUPER_ADMIN", "HR_ADMIN"],
@@ -95,17 +108,22 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Clean shutdown
-    digest_task.cancel()
-    try:
-        await digest_task
-    except asyncio.CancelledError:
-        pass
+    # 6. Clean shutdown
+    if digest_task is not None:
+        digest_task.cancel()
+        try:
+            await digest_task
+        except asyncio.CancelledError:
+            pass
 
     await close_auth_client()
-    await disconnect_redis()
+
+    if redis_connected:
+        await disconnect_redis()
+
     await engine.dispose()
     print("Recognition Service: 🔴 Database Disconnected & Pool Disposed")
+
 
 
 app = FastAPI(

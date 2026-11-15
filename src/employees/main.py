@@ -2,6 +2,7 @@
 src/employees/main.py  — Employee Service entry point.
 Powered by FastAPI, SQLAlchemy 2.0 Async, Redis, and OpenTelemetry.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,40 +41,68 @@ from src.webhooks.router import router as webhooks_router
 logger = logging.getLogger(__name__)
 
 ROLE_OVERRIDES = {
-    "GET:/aabhar/v1/employees/list":                                  ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "GET:/aabhar/v1/employees/{employee_id}":                         ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "POST:/aabhar/v1/employees/create":                               ["SUPER_ADMIN", "HR_ADMIN"],
-    "PUT:/aabhar/v1/employees/{employee_id}":                         ["SUPER_ADMIN", "HR_ADMIN"],
-    "PATCH:/aabhar/v1/employees/{employee_id}":                       ["SUPER_ADMIN", "HR_ADMIN"],
-    "POST:/aabhar/v1/employees/{employee_id}/activate":               ["SUPER_ADMIN", "HR_ADMIN"],
-    "PATCH:/aabhar/v1/employees/{employee_id}/activate":              ["SUPER_ADMIN", "HR_ADMIN"],
-    "POST:/aabhar/v1/employees/{employee_id}/deactivate":             ["SUPER_ADMIN", "HR_ADMIN"],
-    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate":            ["SUPER_ADMIN", "HR_ADMIN"],
-    "GET:/aabhar/v1/employees/notifications":                         ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "GET:/aabhar/v1/employees/notifications/unread-count":            ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "PUT:/aabhar/v1/employees/notifications/{notification_id}/read":  ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "PUT:/aabhar/v1/employees/notifications/read-all":                ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
-    "POST:/aabhar/v1/employees/notifications":                        ["SUPER_ADMIN", "HR_ADMIN"],
-    "POST:/aabhar/v1/employees/notifications/announcements":          ["SUPER_ADMIN", "HR_ADMIN"],
-    "POST:/aabhar/v1/employees/webhooks/hris":                        ["SUPER_ADMIN"],
+    "GET:/aabhar/v1/employees/list": ["SUPER_ADMIN", "HR_ADMIN", "MANAGER", "EMPLOYEE"],
+    "GET:/aabhar/v1/employees/{employee_id}": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+    ],
+    "POST:/aabhar/v1/employees/create": ["SUPER_ADMIN", "HR_ADMIN"],
+    "PUT:/aabhar/v1/employees/{employee_id}": ["SUPER_ADMIN", "HR_ADMIN"],
+    "PATCH:/aabhar/v1/employees/{employee_id}": ["SUPER_ADMIN", "HR_ADMIN"],
+    "POST:/aabhar/v1/employees/{employee_id}/activate": ["SUPER_ADMIN", "HR_ADMIN"],
+    "PATCH:/aabhar/v1/employees/{employee_id}/activate": ["SUPER_ADMIN", "HR_ADMIN"],
+    "POST:/aabhar/v1/employees/{employee_id}/deactivate": ["SUPER_ADMIN", "HR_ADMIN"],
+    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate": ["SUPER_ADMIN", "HR_ADMIN"],
+    "GET:/aabhar/v1/employees/notifications": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+    ],
+    "GET:/aabhar/v1/employees/notifications/unread-count": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+    ],
+    "PUT:/aabhar/v1/employees/notifications/{notification_id}/read": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+    ],
+    "PUT:/aabhar/v1/employees/notifications/read-all": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+    ],
+    "POST:/aabhar/v1/employees/notifications": ["SUPER_ADMIN", "HR_ADMIN"],
+    "POST:/aabhar/v1/employees/notifications/announcements": [
+        "SUPER_ADMIN",
+        "HR_ADMIN",
+    ],
+    "POST:/aabhar/v1/employees/webhooks/hris": ["SUPER_ADMIN"],
 }
 ROUTE_TITLES = {
-    "GET:/aabhar/v1/employees/list":                                  "List Employees",
-    "GET:/aabhar/v1/employees/{employee_id}":                         "Get Employee Details",
-    "POST:/aabhar/v1/employees/create":                               "Create Employee",
-    "PUT:/aabhar/v1/employees/{employee_id}":                         "Update Employee",
-    "PATCH:/aabhar/v1/employees/{employee_id}":                       "Partially Update Employee",
-    "POST:/aabhar/v1/employees/{employee_id}/activate":               "Activate Employee",
-    "PATCH:/aabhar/v1/employees/{employee_id}/activate":              "Activate Employee",
-    "POST:/aabhar/v1/employees/{employee_id}/deactivate":             "Deactivate Employee",
-    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate":            "Deactivate Employee",
-    "GET:/aabhar/v1/employees/notifications":                         "List Notifications",
-    "GET:/aabhar/v1/employees/notifications/unread-count":            "Get Unread Notification Count",
-    "PUT:/aabhar/v1/employees/notifications/{notification_id}/read":  "Mark Notification as Read",
-    "PUT:/aabhar/v1/employees/notifications/read-all":                "Mark All Notifications as Read",
-    "POST:/aabhar/v1/employees/notifications":                        "Send Notification",
-    "POST:/aabhar/v1/employees/notifications/announcements":          "Send Announcement",
-    "POST:/aabhar/v1/employees/webhooks/hris":                        "HRIS Webhook",
+    "GET:/aabhar/v1/employees/list": "List Employees",
+    "GET:/aabhar/v1/employees/{employee_id}": "Get Employee Details",
+    "POST:/aabhar/v1/employees/create": "Create Employee",
+    "PUT:/aabhar/v1/employees/{employee_id}": "Update Employee",
+    "PATCH:/aabhar/v1/employees/{employee_id}": "Partially Update Employee",
+    "POST:/aabhar/v1/employees/{employee_id}/activate": "Activate Employee",
+    "PATCH:/aabhar/v1/employees/{employee_id}/activate": "Activate Employee",
+    "POST:/aabhar/v1/employees/{employee_id}/deactivate": "Deactivate Employee",
+    "PATCH:/aabhar/v1/employees/{employee_id}/deactivate": "Deactivate Employee",
+    "GET:/aabhar/v1/employees/notifications": "List Notifications",
+    "GET:/aabhar/v1/employees/notifications/unread-count": "Get Unread Notification Count",
+    "PUT:/aabhar/v1/employees/notifications/{notification_id}/read": "Mark Notification as Read",
+    "PUT:/aabhar/v1/employees/notifications/read-all": "Mark All Notifications as Read",
+    "POST:/aabhar/v1/employees/notifications": "Send Notification",
+    "POST:/aabhar/v1/employees/notifications/announcements": "Send Announcement",
+    "POST:/aabhar/v1/employees/webhooks/hris": "HRIS Webhook",
 }
 
 _PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
@@ -82,17 +111,22 @@ _CELEB_HOUR = int(os.getenv("CELEBRATION_CRON_HOUR", "0"))
 _CELEB_MINUTE = int(os.getenv("CELEBRATION_CRON_MINUTE", "5"))
 
 
-async def sqlalchemy_integrity_error_handler(_: Request, exc: IntegrityError) -> JSONResponse:
+async def sqlalchemy_integrity_error_handler(
+    _: Request, exc: IntegrityError
+) -> JSONResponse:
     """Handles unique constraints (e.g., username/email collisions) cleanly."""
     return JSONResponse(
         status_code=409,
-        content={"detail": "A database constraint was violated. Record may already exist."},
+        content={
+            "detail": "A database constraint was violated. Record may already exist."
+        },
     )
+
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Verify PostgreSQL connection via SQLAlchemy
+    # 1. Verify PostgreSQL connection
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     print("Employee Service: 🟢 Database Connected (SQLAlchemy 2.0 Async)")
@@ -101,13 +135,19 @@ async def lifespan(app: FastAPI):
     r = None
     try:
         r = await connect_redis()
-        print("Employee Service: ☑️  Redis Connected")
+        print("Employee Service: ☑️ Redis Connected")
     except Exception as exc:
         logger.warning("Redis unavailable: %s", exc)
 
-    smtp_config = SMTPConfig.from_env()
-    email_sender = EmailSender(smtp_config)
+    # 3. Optional SMTP setup
+    email_sender = None
+    try:
+        email_sender = EmailSender(SMTPConfig.from_env())
+        print("Employee Service: 📧 SMTP configured")
+    except (KeyError, ValueError) as exc:
+        logger.warning("SMTP disabled — configuration unavailable: %s", exc)
 
+    # 4. Optional Slack setup
     slack_sender: SlackSender | None = None
     try:
         slack_sender = SlackSender(SlackConfig.from_env())
@@ -117,18 +157,18 @@ async def lifespan(app: FastAPI):
 
     app.state.redis = r
 
-    # 3. Background worker using session factory
+    # 5. Background email worker
     worker_task = None
-    if r is not None:
+    if r is not None and email_sender is not None:
         worker_task = asyncio.create_task(
             email_worker_loop(async_session_factory, email_sender, r, slack_sender),
             name="email_worker",
         )
         print("Employee Service: 📧 Email worker started")
 
-    # 4. APScheduler for celebrations
+    # 6. Celebration scheduler
     scheduler = None
-    if r is not None:
+    if r is not None and email_sender is not None:
         _lock_key = "apscheduler:celebration:lock"
         _lock_ttl = 3600
 
@@ -138,7 +178,9 @@ async def lifespan(app: FastAPI):
                 logger.info("Celebration job: lock held by another instance — skipping")
                 return
             try:
-                await process_celebrations(async_session_factory, email_sender, r, slack_sender)
+                await process_celebrations(
+                    async_session_factory, email_sender, r, slack_sender
+                )
             finally:
                 await r.delete(_lock_key)
 
@@ -159,11 +201,13 @@ async def lifespan(app: FastAPI):
             f"(cron={_CELEB_HOUR:02d}:{_CELEB_MINUTE:02d} daily, Redis lock)"
         )
 
-    registry_task = asyncio.create_task(_load_route_registry(app), name="route_registry")
+    registry_task = asyncio.create_task(
+        _load_route_registry(app), name="route_registry"
+    )
 
     yield
 
-    # Clean shutdown
+    # 7. Clean shutdown
     registry_task.cancel()
 
     if scheduler is not None:
@@ -177,9 +221,12 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    await disconnect_redis()
+    if r is not None:
+        await disconnect_redis()
+
     await engine.dispose()
     print("Employee Service: 🔴 Database Disconnected & Pool Disposed")
+
 
 
 async def _load_route_registry(app: FastAPI) -> None:
@@ -216,10 +263,10 @@ app = FastAPI(
 initialize_cors_and_middleware(app)
 
 app.middleware("http")(request_rate_limit_middleware)
-app.add_exception_handler(IntegrityError,         sqlalchemy_integrity_error_handler)
-app.add_exception_handler(HTTPException,          http_exception_handler)
+app.add_exception_handler(IntegrityError, sqlalchemy_integrity_error_handler)
+app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(Exception,              generic_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 
 @app.get("/health", tags=["System"])
@@ -236,8 +283,8 @@ async def health_check():
 
 
 app.include_router(notifications_router, tags=["Notifications"])
-app.include_router(webhooks_router,      tags=["Webhooks"])
-app.include_router(emp_router,           tags=["Employees"])
+app.include_router(webhooks_router, tags=["Webhooks"])
+app.include_router(emp_router, tags=["Employees"])
 app.include_router(internal_router)
 
 
@@ -265,7 +312,9 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
-setup_telemetry(app, "rnr-employees", excluded_urls="health,/docs,/openapi.json,internal")
+setup_telemetry(
+    app, "rnr-employees", excluded_urls="health,/docs,/openapi.json,internal"
+)
 
 if __name__ == "__main__":
     uvicorn.run("src.employees.main:app", host="0.0.0.0", port=8003, reload=True)

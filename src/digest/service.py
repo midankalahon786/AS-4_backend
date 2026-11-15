@@ -4,6 +4,7 @@ src/digest/service.py
 Digest service layer orchestrating query resolution and HTML email delivery[cite: 37].
 Powered by SQLAlchemy 2.0 AsyncSession[cite: 37].
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,7 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class DigestService:
-    def __init__(self, session: AsyncSession, email_sender: EmailSender) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        email_sender: EmailSender | None = None,
+    ) -> None:
         self.session = session
         self.sender = email_sender
 
@@ -43,10 +48,20 @@ class DigestService:
         manager_id: UUID | None = None,
         week_start: datetime | None = None,
     ) -> DigestResponse:
-        # Guard: Reject future week_start immediately[cite: 37]
+        if self.sender is None:
+            return DigestResponse(
+                success=False,
+                message="Email service is unavailable. SMTP is not configured.",
+            )
+
+        # Guard: Reject future week_start immediately
         if week_start is not None:
             now_utc = datetime.now(tz=timezone.utc)
-            ws = week_start if week_start.tzinfo else week_start.replace(tzinfo=timezone.utc)
+            ws = (
+                week_start
+                if week_start.tzinfo
+                else week_start.replace(tzinfo=timezone.utc)
+            )
             if ws > now_utc:
                 return DigestResponse(
                     success=False,

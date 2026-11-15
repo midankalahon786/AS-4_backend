@@ -22,13 +22,16 @@ router = APIRouter(prefix="/digest", tags=["Weekly Digest"])
 _ADMIN_ROLES = {"SUPER_ADMIN", "HR_ADMIN"}
 
 
-def get_email_sender() -> EmailSender:
-    return EmailSender(SMTPConfig.from_env())
+def get_email_sender() -> EmailSender | None:
+    try:
+        return EmailSender(SMTPConfig.from_env())
+    except (KeyError, ValueError):
+        return None
 
 
 def get_digest_service(
     session: AsyncSession = Depends(get_db),
-    sender: EmailSender = Depends(get_email_sender),
+    sender: EmailSender | None = Depends(get_email_sender),
 ) -> DigestService:
     return DigestService(session, sender)
 

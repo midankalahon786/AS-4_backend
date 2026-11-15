@@ -26,7 +26,10 @@ BASE_DIR = Path(__file__).parent.resolve()
 LOG_DIR = BASE_DIR / ".logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-env_file = BASE_DIR / ".env"
+env_file = Path(os.environ.get("AABHAR_ENV_FILE", ".env"))
+if not env_file.is_absolute():
+    env_file = BASE_DIR / env_file
+    
 if env_file.exists():
     for line in env_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()

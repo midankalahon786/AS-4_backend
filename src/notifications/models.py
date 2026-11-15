@@ -3,13 +3,24 @@ src/notifications/models.py
 ───────────────────────────
 SQLAlchemy 2.0 Declarative model for in-app and delivery-tracked notifications.
 """
+
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,7 +41,6 @@ class Notification(Base):
         PG_UUID(as_uuid=True),
         ForeignKey("employees.employee_id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     title: Mapped[str] = mapped_column(
         String(255),
@@ -43,21 +53,18 @@ class Notification(Base):
     type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        index=True,
     )
     is_read: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         server_default=text("false"),
         nullable=False,
-        index=True,
     )
     email_sent: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         server_default=text("false"),
         nullable=False,
-        index=True,
     )
     send_attempts: Mapped[int] = mapped_column(
         Integer,
@@ -73,7 +80,6 @@ class Notification(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
-        index=True,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -91,8 +97,26 @@ class Notification(Base):
 
     # ── Composite Indexes ─────────────────────────────────────────────────────
     __table_args__ = (
-        # Optimizes fast UI lookups for active employee notifications & unread counts
-        Index("ix_notifications_emp_read_created", "employee_id", "is_read", "created_at"),
-        # Optimizes background worker startup recovery scans
-        Index("ix_notifications_recovery_scan", "email_sent", "type", "send_attempts", "created_at"),
+        # Existing database indexes
+        Index("idx_notifications_created_at", "created_at"),
+        Index(
+            "idx_notifications_email_sent_type_send_created",
+            "email_sent",
+            "type",
+            "send_attempts",
+            "created_at",
+        ),
+        Index("idx_notifications_employee_id", "employee_id"),
+        Index(
+            "idx_notifications_employee_id_is_read",
+            "employee_id",
+            "is_read",
+        ),
+        # Optimizes employee notification retrieval and unread counts
+        Index(
+            "ix_notifications_emp_read_created",
+            "employee_id",
+            "is_read",
+            "created_at",
+        ),
     )

@@ -1,71 +1,64 @@
+
 # =========================
 # STAGE 1 — BUILDER
 # =========================
-FROM python:3.10-slim AS builder
+FROM python:3.11-slim AS builder
+
+# Pin uv to the version used locally
+COPY --from=ghcr.io/astral-sh/uv:0.11.13 /uv /uvx /bin/
 
 WORKDIR /app
 
-# 1. Install OpenSSL (Fixes the warning) and build tools
+# Build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev curl ca-certificates openssl libatomic1 \
+    gcc libpq-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Setup Virtual Env
-RUN python -m venv /app/venv
-ENV PATH="/app/venv/bin:$PATH"
-RUN pip install --upgrade pip
+# Configure uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT="/app/venv" \
+    PATH="/app/venv/bin:$PATH"
 
-ENV PRISMA_CLIENT_PY_ENGINE_TYPE="binary"
+# Install locked production dependencies
+COPY pyproject.toml uv.lock ./
 
-# 3. Install Python Dependencies
-# (Ensure 'prisma' is in your requirements.txt)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-ENV PRISMA_BINARY_CACHE_DIR="/app/.cache/prisma-python"
-# 4. Generate Prisma Client (Using Python's built-in Prisma CLI)
-COPY prisma/ ./prisma/
+RUN uv sync --frozen --no-dev --no-install-project
 
-RUN prisma py fetch && \
-    prisma generate && \
-    rm -rf /root/.cache/prisma-python
-
-
-# 5. Copy the rest of the application code
+# Copy application source
 COPY . .
 
 # =========================
 # STAGE 2 — RUNTIME
 # =========================
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1. Install runtime dependencies (As Root)
+# Runtime libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 ca-certificates openssl libatomic1 \
+    libpq5 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Create user and group (As Root)
-RUN addgroup --system appgroup && adduser --system --group appuser
+# Create non-root user
+RUN addgroup --system appgroup && \
+    adduser --system --group appuser
 
-# 3. Copy app from builder
-# We use --chown here, but we will also do a recursive chown to be safe
+# Copy application and virtual environment
 COPY --from=builder /app /app
 
-# 4. Create logs directory AND fix all permissions (As Root)
-# We do this BEFORE switching to the limited user
+# Configure permissions
 RUN mkdir -p /app/logs && \
     chown -R appuser:appgroup /app && \
-    chmod -R 755 /app/logs
+    chmod 755 /app/logs
 
-# 5. Environment variables
-ENV PATH="/app/venv/bin:$PATH"
-ENV PYTHONPATH="/app"
-ENV PYTHONUNBUFFERED=1
-ENV PRISMA_BINARY_CACHE_DIR="/app/.cache/prisma-python"
+ENV PATH="/app/venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 
-# 6. NOW switch to the limited user
 USER appuser
 
-# Fallback CMD
-CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Default: auth service.
+# Kubernetes can override CMD arguments for other services.
+ENTRYPOINT ["python", "-m", "uvicorn"]
+CMD ["src.auth.main:app", "--host", "0.0.0.0", "--port", "8001"]

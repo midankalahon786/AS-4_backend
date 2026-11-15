@@ -28,6 +28,18 @@ prisma_binaries/
 .env
 .env.*
 
+.venv/
+venv/
+.uv_cache/
+.uv/
+.logs/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+
 # Careful with *.json!
 # If you have *.json here, things like "ecosystem.config.json" (if you rename it) 
 # or custom config JSON files for your python app will be ignored. 

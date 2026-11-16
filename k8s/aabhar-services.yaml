@@ -1,0 +1,575 @@
+apiVersion: v1
+kind: List
+items:
+  # AUTH SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: auth
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: auth
+      template:
+        metadata:
+          labels:
+            app: auth
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: auth
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.auth.main:app", "--host", "0.0.0.0", "--port", "8001"]
+              ports:
+                - name: http
+                  containerPort: 8001
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: auth-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: auth
+      ports:
+        - name: http
+          port: 8001
+          targetPort: http
+
+  # ROLES SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: roles
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: roles
+      template:
+        metadata:
+          labels:
+            app: roles
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: roles
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.roles.main:app", "--host", "0.0.0.0", "--port", "8002"]
+              ports:
+                - name: http
+                  containerPort: 8002
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: roles-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: roles
+      ports:
+        - name: http
+          port: 8002
+          targetPort: http
+
+  # EMPLOYEES SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: employees
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: employees
+      template:
+        metadata:
+          labels:
+            app: employees
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: employees
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.employees.main:app", "--host", "0.0.0.0", "--port", "8003"]
+              ports:
+                - name: http
+                  containerPort: 8003
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+                - name: ROLES_SERVICE_URL
+                  value: "http://roles-service:8002"
+                - name: ORGANIZATION_SERVICE_URL
+                  value: "http://organization-service:8007"
+                - name: WALLET_SERVICE_URL
+                  value: "http://wallet-service:8004"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: employees-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: employees
+      ports:
+        - name: http
+          port: 8003
+          targetPort: http
+
+  # WALLET SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: wallet
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: wallet
+      template:
+        metadata:
+          labels:
+            app: wallet
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: wallet
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.wallet.main:app", "--host", "0.0.0.0", "--port", "8004"]
+              ports:
+                - name: http
+                  containerPort: 8004
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: wallet-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: wallet
+      ports:
+        - name: http
+          port: 8004
+          targetPort: http
+
+  # RECOGNITION SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: recognition
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: recognition
+      template:
+        metadata:
+          labels:
+            app: recognition
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: recognition
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.recognition.main:app", "--host", "0.0.0.0", "--port", "8005"]
+              ports:
+                - name: http
+                  containerPort: 8005
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: recognition-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: recognition
+      ports:
+        - name: http
+          port: 8005
+          targetPort: http
+
+  # REWARDS SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: rewards
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: rewards
+      template:
+        metadata:
+          labels:
+            app: rewards
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: rewards
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.rewards.main:app", "--host", "0.0.0.0", "--port", "8006"]
+              ports:
+                - name: http
+                  containerPort: 8006
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+                - name: WALLET_SERVICE_URL
+                  value: "http://wallet-service:8004"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: rewards-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: rewards
+      ports:
+        - name: http
+          port: 8006
+          targetPort: http
+
+  # ORGANIZATION SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: organization
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: organization
+      template:
+        metadata:
+          labels:
+            app: organization
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: organization
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.organization.main:app", "--host", "0.0.0.0", "--port", "8007"]
+              ports:
+                - name: http
+                  containerPort: 8007
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: organization-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: organization
+      ports:
+        - name: http
+          port: 8007
+          targetPort: http
+
+  # ANALYTICS SERVICE
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: analytics
+      namespace: aabhar
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: analytics
+      template:
+        metadata:
+          labels:
+            app: analytics
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: analytics
+              image: 192.168.42.141:5000/aabhar-backend:2
+              imagePullPolicy: IfNotPresent
+              args: ["src.analytics.main:app", "--host", "0.0.0.0", "--port", "8008"]
+              ports:
+                - name: http
+                  containerPort: 8008
+              envFrom:
+                - configMapRef:
+                    name: aabhar-config
+                - secretRef:
+                    name: aabhar-runtime
+                - secretRef:
+                    name: aabhar-jwt
+              env:
+                - name: AUTH_SERVICE_URL
+                  value: "http://auth-service:8001/aabhar/v1/auth/validate"
+                - name: WALLET_SERVICE_URL
+                  value: "http://wallet-service:8004"
+                - name: RECOGNITION_SERVICE_URL
+                  value: "http://recognition-service:8005"
+                - name: EMPLOYEES_SERVICE_URL
+                  value: "http://employees-service:8003"
+                - name: ORGANIZATION_SERVICE_URL
+                  value: "http://organization-service:8007"
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: analytics-service
+      namespace: aabhar
+    spec:
+      type: ClusterIP
+      selector:
+        app: analytics
+      ports:
+        - name: http
+          port: 8008
+          targetPort: http

@@ -48,15 +48,77 @@ pipeline {
                 '''
             }
         }
+
+        stage('Deploy to K3s') {
+            when {
+                branch 'local-dev'
+            }
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'aabhar-k3s-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "Checking Kubernetes client..."
+                        command -v kubectl
+                        kubectl version --client
+
+                        echo "Deploying image: $IMAGE:$TAG"
+
+                        for service in \
+                            auth \
+                            roles \
+                            employees \
+                            wallet \
+                            recognition \
+                            rewards \
+                            organization \
+                            analytics
+                        do
+                            echo "Updating $service..."
+                            kubectl set image \
+                                deployment/$service \
+                                $service=$IMAGE:$TAG \
+                                -n aabhar
+                        done
+
+                        echo "Waiting for deployment rollouts..."
+
+                        for service in \
+                            auth \
+                            roles \
+                            employees \
+                            wallet \
+                            recognition \
+                            rewards \
+                            organization \
+                            analytics
+                        do
+                            echo "Waiting for $service..."
+                            kubectl rollout status \
+                                deployment/$service \
+                                -n aabhar \
+                                --timeout=180s
+                        done
+
+                        echo "All eight services deployed successfully."
+                    '''
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo "Successfully built and pushed ${IMAGE}:${TAG}"
+            echo "Successfully built, pushed, and deployed ${IMAGE}:${TAG}"
         }
 
         failure {
-            echo "Aabhar backend image build or push failed."
+            echo "Aabhar backend pipeline failed. Check the failed stage and deployment logs."
         }
     }
 }
